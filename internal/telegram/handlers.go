@@ -93,30 +93,32 @@ func (h *BotHandler) handleWebAccess(c tele.Context) error {
 
 	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("WEB_APP_URL")), "/")
 	if baseURL == "" {
-		return c.Send("⚠️ Адрес веб-приложения не настроен на сервере (`WEB_APP_URL`).", tele.ModeMarkdown)
+		return c.Send("⚠️ Адрес веб-приложения не настроен на сервере (WEB_APP_URL).")
 	}
 
 	heroName := domain.GetStr(hero.Data, "name", "Герой")
 	webLink := fmt.Sprintf("%s/?room=%s&playerHeroId=%s", baseURL, hero.RoomCode, hero.ID)
 
 	passHash := domain.GetStr(hero.Data, "playerPasswordHash", "")
-	passStatus := "🔓 _Вход свободный по ссылке_"
+	passStatus := "🔓 <i>Вход свободный по ссылке</i>"
 	if passHash != "" {
-		passStatus = "🔒 _Для входа потребуется ваш пароль игрока_"
+		passStatus = "🔒 <i>Для входа потребуется ваш пароль игрока</i>"
 	}
 
 	msg := fmt.Sprintf(
-		"🌐 *Веб-лист и карта мира: %s*\n"+
+		"🌐 <b>Веб-лист и карта мира: %s</b>\n"+
 			"━━━━━━━━━━━━━━━━━━━━\n"+
-			"🔗 %s\n\n"+
+			"🔗 <a href=\"%s\">Открыть лист персонажа</a>\n"+
+			"<code>%s</code>\n\n"+
 			"%s\n"+
-			"_⚠️ Не передавайте эту ссылку посторонним._",
+			"<i>⚠️ Не передавайте эту ссылку посторонним.</i>",
 		heroName,
+		webLink,
 		webLink,
 		passStatus,
 	)
 
-	return c.Send(msg, h.mainMenu, tele.ModeMarkdown)
+	return c.Send(msg, h.mainMenu, tele.ModeHTML)
 }
 
 func (h *BotHandler) handleBindChat(c tele.Context) error {
