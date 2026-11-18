@@ -27,6 +27,7 @@ type BotHandler struct {
 	mainMenu    *tele.ReplyMarkup
 	btnMe       tele.Btn
 	btnSpell    tele.Btn
+	btnEquip    tele.Btn
 	btnGive     tele.Btn
 	btnPay      tele.Btn
 	btnWeb      tele.Btn
@@ -37,12 +38,13 @@ func NewBotHandler(repo *repository.HeroRepository) *BotHandler {
 	menu := &tele.ReplyMarkup{ResizeKeyboard: true}
 	btnMe := menu.Text("🛡️ Мой персонаж")
 	btnSpell := menu.Text("✨ Заклинания и рюкзак")
+	btnEquip := menu.Text("🦺 Броня и щит")
 	btnGive := menu.Text("🎁 Передать вещь")
 	btnPay := menu.Text("💸 Передать монеты")
 	btnWeb := menu.Text("🌐 Веб-лист и карта")
 	menu.Reply(
 		menu.Row(btnMe, btnSpell),
-		menu.Row(btnGive, btnPay),
+		menu.Row(btnEquip, btnGive, btnPay),
 		menu.Row(btnWeb),
 	)
 
@@ -51,6 +53,7 @@ func NewBotHandler(repo *repository.HeroRepository) *BotHandler {
 		mainMenu: menu,
 		btnMe:    btnMe,
 		btnSpell: btnSpell,
+		btnEquip: btnEquip,
 		btnGive:  btnGive,
 		btnPay:   btnPay,
 		btnWeb:   btnWeb,
@@ -70,6 +73,10 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle("/bind_chat", h.handleBindChat)
 	b.Handle("/web", h.handleWebAccess)
 	b.Handle(&h.btnWeb, h.handleWebAccess)
+	b.Handle("/equip", h.handleEquipMenu)
+	b.Handle(&h.btnEquip, h.handleEquipMenu)
+	b.Handle(&tele.Btn{Unique: "eq_off"}, h.handleUnequipAction)
+	b.Handle(&tele.Btn{Unique: "eq_on"}, h.handleEquipFromBagAction)
 
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
@@ -485,4 +492,115 @@ func formatCoinsStr(g, s, c int) string {
 		parts = append(parts, fmt.Sprintf("%d ММ", c))
 	}
 	return strings.Join(parts, " ")
+}
+
+func (h *BotHandler) handleEquipMenu(c tele.Context) error {
+	h.pendingPays.Delete(c.Sender().ID)
+	hero, err := h.repo.GetHeroByTgID(context.Background(), c.Sender().ID)
+	if err != nil {
+		return c.Send("⚠️ Персонаж не привязан.")
+	}
+	if hero.IsReadOnly {
+		return c.Send("🔒 Мастер заблокировал ваш лист (режим Read-Only). Смена снаряжения недоступна.")
+	}
+
+	s := hero.Stats()
+	curArmor := domain.GetStr(s, "armorName", domain.GetStr(s, "eq_armor_Name", ""))
+	shieldBonus := domain.GetInt(s, "acShieldBonus", 0)
+	curShield := domain.GetStr(s, "eq_offHand_Name", "")
+	if curShield == "" && shieldBonus > 0 {
+		curShield = fmt.Sprintf("Щит (+%d КБ)", shieldBonus)
+	}
+	curAC := domain.GetInt(s, "ac", 10)
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	// Кнопки снятия надетого
+	if curArmor != "" {
+		rows = append(rows, inline.Row(inline.Data("❌ Снять доспех: "+curArmor, "eq_off", "armor")))
+	}
+	if (curShield != "" && !strings.HasPrefix(curShield, "🔒")) || shieldBonus > 0 {
+		label := curShield
+		if label == "" {
+			label = "Щит"
+		}
+		rows = append(rows, inline.Row(inline.Data("❌ Снять щит: "+label, "eq_off", "shield")))
+	}
+
+	// Поиск доспехов и щитов в рюкзаке (слоты 1..15)
+	gearKeywords := []string{"доспех", "брон", "лат", "кольчуг", "кирас", "кожан", "стеган", "стёган", "чешуй", "роба", "манти", "щит", "баклер", "armor", "shield"}
+	for i := 1; i <= 15; i++ {
+		iName := domain.GetStr(s, fmt.Sprintf("item%dName", i), "")
+		qty := domain.GetInt(s, fmt.Sprintf("item%dQty", i), 0)
+		if iName == "" || qty <= 0 {
+			continue
+		}
+		iNotes := domain.GetStr(s, fmt.Sprintf("item%dNotes", i), "")
+		lower := strings.ToLower(iName + " " + iNotes)
+
+		isGear := false
+		for _, kw := range gearKeywords {
+			if strings.Contains(lower, kw) {
+				isGear = true
+				break
+			}
+		}
+		if isGear && iName != curArmor && iName != curShield {
+			rows = append(rows, inline.Row(inline.Data("⬆️ Надеть: "+iName, "eq_on", strconv.Itoa(i))))
+		}
+	}
+
+	rows = append(rows, inline.Row(inline.Data("✖ Закрыть", "tr_cancel", "0")))
+	inline.Inline(rows...)
+
+	armorText := "нет (без брони)"
+	if curArmor != "" {
+		armorText = curArmor
+	}
+	shieldText := "нет"
+	if curShield != "" && !strings.HasPrefix(curShield, "🔒") {
+		shieldText = fmt.Sprintf("%s (+%d КБ)", curShield, shieldBonus)
+	}
+
+	msg := fmt.Sprintf(
+		"🦺 *Управление экипировкой*\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"🛡️ *Текущий КБ:* `%d`\n"+
+			"🧥 *Доспех:* %s\n"+
+			"🛡️ *Щит:* %s\n\n"+
+			"_Выберите действие ниже:_",
+		curAC, armorText, shieldText,
+	)
+
+	return c.Send(msg, inline, tele.ModeMarkdown)
+}
+
+func (h *BotHandler) handleUnequipAction(c tele.Context) error {
+	_ = c.Respond()
+	gearType := c.Callback().Data
+	removedName, newAC, err := h.repo.UnequipGear(context.Background(), c.Sender().ID, gearType)
+	if err != nil {
+		return c.Edit(fmt.Sprintf("❌ Ошибка: %s", err.Error()))
+	}
+	return c.Edit(
+		fmt.Sprintf("✅ Вы сняли *%s*.\n🛡️ Новый итоговый КБ: *%d*", removedName, newAC),
+		tele.ModeMarkdown,
+	)
+}
+
+func (h *BotHandler) handleEquipFromBagAction(c tele.Context) error {
+	_ = c.Respond()
+	slotIdx, err := strconv.Atoi(c.Callback().Data)
+	if err != nil {
+		return c.Edit("❌ Некорректный слот.")
+	}
+	equippedName, newAC, err := h.repo.EquipFromBackpack(context.Background(), c.Sender().ID, slotIdx)
+	if err != nil {
+		return c.Edit(fmt.Sprintf("❌ Ошибка: %s", err.Error()))
+	}
+	return c.Edit(
+		fmt.Sprintf("✅ Вы надели *%s*!\n🛡️ Новый итоговый КБ: *%d*", equippedName, newAC),
+		tele.ModeMarkdown,
+	)
 }

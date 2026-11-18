@@ -434,3 +434,329 @@ func (r *HeroRepository) GetTrackedCampaigns(ctx context.Context) ([]CampaignMap
 	}
 	return result, nil
 }
+
+// UnequipGear снимает надетый доспех или щит, кладёт его в свободный слот рюкзака и пересчитывает КБ
+func (r *HeroRepository) UnequipGear(ctx context.Context, tgUserID int64, gearType string) (string, int, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var heroID string
+	var isReadOnly bool
+	var rawJSON []byte
+	err = tx.QueryRow(ctx, `
+		SELECT id, is_readonly, hero_data
+		FROM public.campaign_heroes
+		WHERE telegram_user_id = $1
+		FOR UPDATE
+	`, tgUserID).Scan(&heroID, &isReadOnly, &rawJSON)
+	if err != nil {
+		return "", 0, fmt.Errorf("персонаж не найден")
+	}
+	if isReadOnly {
+		return "", 0, fmt.Errorf("лист заблокирован Мастером (Read-Only)")
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(rawJSON, &data); err != nil {
+		return "", 0, err
+	}
+	s := ensureStatsMap(data)
+
+	var removedName string
+	var removedNotes string
+
+	if gearType == "armor" {
+		removedName = domain.GetStr(s, "armorName", domain.GetStr(s, "eq_armor_Name", ""))
+		if removedName == "" {
+			return "", 0, fmt.Errorf("доспех не надет")
+		}
+		removedNotes = domain.GetStr(s, "armorNotes", "")
+	} else if gearType == "shield" {
+		removedName = domain.GetStr(s, "eq_offHand_Name", "")
+		bonus := domain.GetInt(s, "acShieldBonus", 0)
+		if removedName == "" && bonus > 0 {
+			removedName = "Щит"
+		}
+		if removedName == "" || strings.HasPrefix(removedName, "🔒") {
+			return "", 0, fmt.Errorf("щит не надет")
+		}
+		removedNotes = fmt.Sprintf("Щит +%d КБ, Твёрдость %d, ПЗ %d",
+			bonus, domain.GetInt(s, "acShieldHardness", 5), domain.GetInt(s, "acShieldHp", 20))
+	} else {
+		return "", 0, fmt.Errorf("неизвестный тип экипировки")
+	}
+
+	// Кладём в рюкзак (если там нет предмета с таким именем и Qty > 0)
+	if !hasItemInBackpack(s, removedName) {
+		emptySlot := findEmptyBackpackSlot(s)
+		if emptySlot == -1 {
+			return "", 0, fmt.Errorf("рюкзак заполнен (15/15 слотов) — освободите место перед снятием")
+		}
+		s[fmt.Sprintf("item%dName", emptySlot)] = removedName
+		s[fmt.Sprintf("item%dQty", emptySlot)] = 1
+		if removedNotes != "" {
+			s[fmt.Sprintf("item%dNotes", emptySlot)] = removedNotes
+		}
+	}
+
+	// Полностью очищаем слот доспеха или щита
+	if gearType == "armor" {
+		s["armorName"] = ""
+		s["armorNotes"] = ""
+		s["eq_armor_Name"] = ""
+		s["eq_armor_Invested"] = false
+		s["armorType"] = "unarmored"
+		s["acItem"] = 0
+		s["acArmorPenalty"] = 0
+		dex := domain.GetInt(s, "dex", 0)
+		if dex > 5 {
+			dex = 5
+		}
+		s["acDex"] = dex
+	} else if gearType == "shield" {
+		s["eq_offHand_Name"] = ""
+		s["eq_offHand_Invested"] = false
+		s["acShieldBonus"] = 0
+		s["acShieldHardness"] = 0
+		s["acShieldHp"] = 0
+	}
+
+	newAC := recalcSheetAC(s)
+	updatedBytes, _ := json.Marshal(data)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE public.campaign_heroes SET hero_data = $1::jsonb, updated_at = NOW() WHERE id = $2
+	`, string(updatedBytes), heroID); err != nil {
+		return "", 0, err
+	}
+
+	return removedName, newAC, tx.Commit(ctx)
+}
+
+func findEmptyBackpackSlot(s map[string]any) int {
+	for i := 1; i <= 15; i++ {
+		name := domain.GetStr(s, fmt.Sprintf("item%dName", i), "")
+		qty := domain.GetInt(s, fmt.Sprintf("item%dQty", i), 0)
+		if name == "" || qty <= 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func hasItemInBackpack(s map[string]any, name string) bool {
+	target := normalizeItemName(name)
+	for i := 1; i <= 15; i++ {
+		sName := normalizeItemName(domain.GetStr(s, fmt.Sprintf("item%dName", i), ""))
+		qty := domain.GetInt(s, fmt.Sprintf("item%dQty", i), 0)
+		if sName == target && qty > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func recalcSheetAC(s map[string]any) int {
+	ac := 10 +
+		domain.GetInt(s, "acDex", 0) +
+		domain.GetInt(s, "acProf", 0) +
+		domain.GetInt(s, "acItem", 0) +
+		domain.GetInt(s, "acOther", 0)
+	s["ac"] = ac
+	return ac
+}
+
+func detectArmorStats(text string) (armorType string, acBonus int, dexCap int, penalty int) {
+	switch {
+	case strings.Contains(text, "латн") || strings.Contains(text, "полн") || strings.Contains(text, "полулат"):
+		return "heavy", 6, 0, -3
+	case strings.Contains(text, "кольчуг") || strings.Contains(text, "чешуй") || strings.Contains(text, "кирас") || strings.Contains(text, "ламел") || strings.Contains(text, "нагруд"):
+		return "medium", 4, 1, -2
+	case strings.Contains(text, "кольчужн") || strings.Contains(text, "рубах"):
+		return "medium", 3, 2, -1
+	case strings.Contains(text, "кожан") || strings.Contains(text, "клёпан") || strings.Contains(text, "стеган") || strings.Contains(text, "стёган") || strings.Contains(text, "шкур"):
+		return "light", 2, 3, -1
+	default:
+		return "light", 1, 4, 0
+	}
+}
+
+func parseFirstBonus(text string, variants []string) int {
+	for _, v := range variants {
+		if strings.Contains(text, v) {
+			switch v {
+			case "+1":
+				return 1
+			case "+2":
+				return 2
+			case "+3":
+				return 3
+			}
+		}
+	}
+	return 0
+}
+
+// EquipFromBackpack надевает доспех или щит из указанного слота рюкзака (1..15) и убирает его из рюкзака
+func (r *HeroRepository) EquipFromBackpack(ctx context.Context, tgUserID int64, slotIdx int) (string, int, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	var heroID string
+	var isReadOnly bool
+	var rawJSON []byte
+	err = tx.QueryRow(ctx, `
+		SELECT id, is_readonly, hero_data
+		FROM public.campaign_heroes
+		WHERE telegram_user_id = $1
+		FOR UPDATE
+	`, tgUserID).Scan(&heroID, &isReadOnly, &rawJSON)
+	if err != nil {
+		return "", 0, fmt.Errorf("персонаж не найден")
+	}
+	if isReadOnly {
+		return "", 0, fmt.Errorf("лист заблокирован Мастером (Read-Only)")
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(rawJSON, &data); err != nil {
+		return "", 0, err
+	}
+	s := ensureStatsMap(data)
+
+	nameKey := fmt.Sprintf("item%dName", slotIdx)
+	qtyKey := fmt.Sprintf("item%dQty", slotIdx)
+	notesKey := fmt.Sprintf("item%dNotes", slotIdx)
+
+	itemName := domain.GetStr(s, nameKey, "")
+	itemNotes := domain.GetStr(s, notesKey, "")
+	if itemName == "" {
+		return "", 0, fmt.Errorf("выбранный слот рюкзака пуст")
+	}
+
+	// Убираем 1 шт. из рюкзака
+	curQty := domain.GetInt(s, qtyKey, 1)
+	if curQty <= 1 {
+		s[nameKey] = ""
+		s[qtyKey] = 0
+		s[notesKey] = ""
+	} else {
+		s[qtyKey] = curQty - 1
+	}
+
+	lowerAll := strings.ToLower(itemName + " " + itemNotes)
+	isShield := strings.Contains(lowerAll, "щит") || strings.Contains(lowerAll, "баклер") || strings.Contains(lowerAll, "shield")
+
+	if isShield {
+		// Если уже был надет другой щит — возвращаем его в рюкзак
+		prevShield := domain.GetStr(s, "eq_offHand_Name", "")
+		if prevShield != "" && !strings.HasPrefix(prevShield, "🔒") && !hasItemInBackpack(s, prevShield) {
+			if free := findEmptyBackpackSlot(s); free != -1 {
+				s[fmt.Sprintf("item%dName", free)] = prevShield
+				s[fmt.Sprintf("item%dQty", free)] = 1
+			}
+		}
+
+		s["eq_offHand_Name"] = itemName
+		bonus := parseFirstBonus(lowerAll, []string{"+1", "+2", "+3"})
+		if bonus == 0 {
+			if strings.Contains(lowerAll, "баклер") {
+				bonus = 1
+			} else {
+				bonus = 2
+			}
+		}
+		s["acShieldBonus"] = bonus
+		if domain.GetInt(s, "acShieldHardness", 0) == 0 {
+			s["acShieldHardness"] = 5
+		}
+		if domain.GetInt(s, "acShieldHp", 0) == 0 {
+			s["acShieldHp"] = 20
+		}
+	} else {
+		// Если уже был надет другой доспех — возвращаем его в рюкзак
+		prevArmor := domain.GetStr(s, "armorName", domain.GetStr(s, "eq_armor_Name", ""))
+		if prevArmor != "" && !hasItemInBackpack(s, prevArmor) {
+			if free := findEmptyBackpackSlot(s); free != -1 {
+				s[fmt.Sprintf("item%dName", free)] = prevArmor
+				s[fmt.Sprintf("item%dQty", free)] = 1
+			}
+		}
+
+		s["armorName"] = itemName
+		s["eq_armor_Name"] = itemName
+		s["armorNotes"] = itemNotes
+
+		armorType, acBonus, dexCap, penalty := detectArmorStats(lowerAll)
+		s["armorType"] = armorType
+		s["acItem"] = acBonus
+		s["acArmorPenalty"] = penalty
+
+		dex := domain.GetInt(s, "dex", 0)
+		if dex > dexCap {
+			dex = dexCap
+		}
+		s["acDex"] = dex
+	}
+
+	newAC := recalcSheetAC(s)
+	updatedBytes, _ := json.Marshal(data)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE public.campaign_heroes SET hero_data = $1::jsonb, updated_at = NOW() WHERE id = $2
+	`, string(updatedBytes), heroID); err != nil {
+		return "", 0, err
+	}
+
+	return itemName, newAC, tx.Commit(ctx)
+}
+
+type TgNotification struct {
+	ID      string
+	TgID    int64
+	Message string
+}
+
+func (r *HeroRepository) PopPendingNotifications(ctx context.Context) ([]TgNotification, error) {
+	var totalCount int
+	if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM public.tg_notifications`).Scan(&totalCount); err != nil {
+		return nil, fmt.Errorf("count error: %w", err)
+	}
+	if totalCount > 0 {
+		fmt.Printf("📬 Найдено записей в tg_notifications: %d\n", totalCount)
+	}
+
+	rows, err := r.db.Query(ctx, `
+		WITH popped AS (
+			DELETE FROM public.tg_notifications
+			RETURNING id, target_hero_id, message
+		)
+		SELECT p.id, COALESCE(h.telegram_user_id, 0), p.target_hero_id, p.message
+		FROM popped p
+		LEFT JOIN public.campaign_heroes h ON TRIM(h.id) = TRIM(p.target_hero_id)
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []TgNotification
+	for rows.Next() {
+		var item TgNotification
+		var heroID string
+		if err := rows.Scan(&item.ID, &item.TgID, &heroID, &item.Message); err == nil {
+			if item.TgID == 0 {
+				fmt.Printf("⚠️ Пропуск уведомления: у героя %q не привязан telegram_user_id в campaign_heroes\n", heroID)
+				continue
+			}
+			list = append(list, item)
+		}
+	}
+	return list, nil
+}

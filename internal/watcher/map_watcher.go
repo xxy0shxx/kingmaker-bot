@@ -31,7 +31,9 @@ func NewMapWatcher(repo *repository.HeroRepository, bot *tele.Bot) *MapWatcher {
 }
 
 func (w *MapWatcher) Start(ctx context.Context) {
+	log.Println("🔄 MapWatcher запущен (опрос карты и уведомлений каждые 3 сек)...")
 	ticker := time.NewTicker(3 * time.Second)
+
 	defer ticker.Stop()
 
 	for {
@@ -40,6 +42,24 @@ func (w *MapWatcher) Start(ctx context.Context) {
 			return
 		case <-ticker.C:
 			w.checkRooms(ctx)
+			w.processNotifications(ctx)
+		}
+	}
+}
+
+func (w *MapWatcher) processNotifications(ctx context.Context) {
+	notes, err := w.repo.PopPendingNotifications(ctx)
+	if err != nil {
+		log.Printf("Ошибка чтения tg_notifications: %v", err)
+		return
+	}
+	for _, n := range notes {
+		log.Printf("Отправка TG-уведомления (tg_id=%d): %s", n.TgID, n.Message)
+		if _, err := w.bot.Send(&tele.User{ID: n.TgID}, n.Message, tele.ModeMarkdown); err != nil {
+			log.Printf("Ошибка Markdown при отправке %d (%v), повторяем без форматирования...", n.TgID, err)
+			if _, errPlain := w.bot.Send(&tele.User{ID: n.TgID}, n.Message); errPlain != nil {
+				log.Printf("Не удалось отправить уведомление игроку %d: %v", n.TgID, errPlain)
+			}
 		}
 	}
 }
