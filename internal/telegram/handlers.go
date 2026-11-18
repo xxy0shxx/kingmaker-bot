@@ -29,6 +29,7 @@ type BotHandler struct {
 	btnSpell    tele.Btn
 	btnGive     tele.Btn
 	btnPay      tele.Btn
+	btnWeb      tele.Btn
 	pendingPays sync.Map
 }
 
@@ -38,9 +39,11 @@ func NewBotHandler(repo *repository.HeroRepository) *BotHandler {
 	btnSpell := menu.Text("✨ Заклинания и рюкзак")
 	btnGive := menu.Text("🎁 Передать вещь")
 	btnPay := menu.Text("💸 Передать монеты")
+	btnWeb := menu.Text("🌐 Веб-лист и карта")
 	menu.Reply(
 		menu.Row(btnMe, btnSpell),
 		menu.Row(btnGive, btnPay),
+		menu.Row(btnWeb),
 	)
 
 	return &BotHandler{
@@ -50,6 +53,7 @@ func NewBotHandler(repo *repository.HeroRepository) *BotHandler {
 		btnSpell: btnSpell,
 		btnGive:  btnGive,
 		btnPay:   btnPay,
+		btnWeb:   btnWeb,
 	}
 }
 
@@ -64,6 +68,8 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle("/pay", h.handlePayStart)
 	b.Handle(&h.btnPay, h.handlePayStart)
 	b.Handle("/bind_chat", h.handleBindChat)
+	b.Handle("/web", h.handleWebAccess)
+	b.Handle(&h.btnWeb, h.handleWebAccess)
 
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
@@ -76,6 +82,41 @@ func (h *BotHandler) Register(b *tele.Bot) {
 
 	b.Handle(&tele.Btn{Unique: "pay_to"}, h.handlePaySelectRecipient)
 	b.Handle(tele.OnText, h.handleTextMessage)
+}
+
+func (h *BotHandler) handleWebAccess(c tele.Context) error {
+	h.pendingPays.Delete(c.Sender().ID)
+	hero, err := h.repo.GetHeroByTgID(context.Background(), c.Sender().ID)
+	if err != nil {
+		return c.Send("⚠️ Персонаж не привязан. Перейдите по ссылке привязки от Мастера.")
+	}
+
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("WEB_APP_URL")), "/")
+	if baseURL == "" {
+		return c.Send("⚠️ Адрес веб-приложения не настроен на сервере (`WEB_APP_URL`).", tele.ModeMarkdown)
+	}
+
+	heroName := domain.GetStr(hero.Data, "name", "Герой")
+	webLink := fmt.Sprintf("%s/?room=%s&playerHeroId=%s", baseURL, hero.RoomCode, hero.ID)
+
+	passHash := domain.GetStr(hero.Data, "playerPasswordHash", "")
+	passStatus := "🔓 _Вход свободный по ссылке_"
+	if passHash != "" {
+		passStatus = "🔒 _Для входа потребуется ваш пароль игрока_"
+	}
+
+	msg := fmt.Sprintf(
+		"🌐 *Веб-лист и карта мира: %s*\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"🔗 %s\n\n"+
+			"%s\n"+
+			"_⚠️ Не передавайте эту ссылку посторонним._",
+		heroName,
+		webLink,
+		passStatus,
+	)
+
+	return c.Send(msg, h.mainMenu, tele.ModeMarkdown)
 }
 
 func (h *BotHandler) handleBindChat(c tele.Context) error {
