@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -78,6 +79,11 @@ func (h *BotHandler) Register(b *tele.Bot) {
 }
 
 func (h *BotHandler) handleBindChat(c tele.Context) error {
+	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
+	if adminID != 0 && c.Sender().ID != adminID {
+		return c.Send("⛔ Только Мастер кампании может привязывать групповые чаты.")
+	}
+
 	if c.Chat().Type == tele.ChatPrivate {
 		return c.Send("⚠️ Эту команду нужно отправить в **групповом чате** вашей партии, а не в личных сообщениях.", tele.ModeMarkdown)
 	}
