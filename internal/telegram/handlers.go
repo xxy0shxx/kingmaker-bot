@@ -38,7 +38,7 @@ func NewBotHandler(repo *repository.HeroRepository) *BotHandler {
 	menu := &tele.ReplyMarkup{ResizeKeyboard: true}
 	btnMe := menu.Text("🛡️ Мой персонаж")
 	btnSpell := menu.Text("✨ Заклинания и рюкзак")
-	btnEquip := menu.Text("🦺 Броня и щит")
+	btnEquip := menu.Text("⚔️ Снаряжение")
 	btnGive := menu.Text("🎁 Передать вещь")
 	btnPay := menu.Text("💸 Передать монеты")
 	btnWeb := menu.Text("🌐 Веб-лист и карта")
@@ -506,30 +506,33 @@ func (h *BotHandler) handleEquipMenu(c tele.Context) error {
 
 	s := hero.Stats()
 	curArmor := domain.GetStr(s, "armorName", domain.GetStr(s, "eq_armor_Name", ""))
+	curMainHand := domain.GetStr(s, "eq_mainHand_Name", domain.GetStr(s, "melee1Name", ""))
+	curOffHand := domain.GetStr(s, "eq_offHand_Name", "")
 	shieldBonus := domain.GetInt(s, "acShieldBonus", 0)
-	curShield := domain.GetStr(s, "eq_offHand_Name", "")
-	if curShield == "" && shieldBonus > 0 {
-		curShield = fmt.Sprintf("Щит (+%d КБ)", shieldBonus)
+	if curOffHand == "" && shieldBonus > 0 {
+		curOffHand = fmt.Sprintf("Щит (+%d КБ)", shieldBonus)
 	}
 	curAC := domain.GetInt(s, "ac", 10)
 
 	inline := &tele.ReplyMarkup{}
 	var rows []tele.Row
 
-	// Кнопки снятия надетого
 	if curArmor != "" {
 		rows = append(rows, inline.Row(inline.Data("❌ Снять доспех: "+curArmor, "eq_off", "armor")))
 	}
-	if (curShield != "" && !strings.HasPrefix(curShield, "🔒")) || shieldBonus > 0 {
-		label := curShield
-		if label == "" {
-			label = "Щит"
-		}
-		rows = append(rows, inline.Row(inline.Data("❌ Снять щит: "+label, "eq_off", "shield")))
+	if curMainHand != "" {
+		rows = append(rows, inline.Row(inline.Data("❌ Убрать оружие: "+curMainHand, "eq_off", "mainHand")))
+	}
+	if curOffHand != "" && !strings.HasPrefix(curOffHand, "🔒") {
+		rows = append(rows, inline.Row(inline.Data("❌ Убрать из левой руки: "+curOffHand, "eq_off", "offHand")))
 	}
 
-	// Поиск доспехов и щитов в рюкзаке (слоты 1..15)
-	gearKeywords := []string{"доспех", "брон", "лат", "кольчуг", "кирас", "кожан", "стеган", "стёган", "чешуй", "роба", "манти", "щит", "баклер", "armor", "shield"}
+	gearKeywords := []string{
+		"доспех", "брон", "лат", "кольчуг", "кирас", "кожан", "стеган", "стёган", "чешуй", "роба", "манти", "armor",
+		"щит", "баклер", "shield",
+		"меч", "клинок", "кинжал", "топор", "секир", "молот", "булав", "палиц", "копь", "алебард", "глеф", "посох", "рапир", "сабл", "лук", "арбалет", "пращ", "цест", "кастет",
+	}
+
 	for i := 1; i <= 15; i++ {
 		iName := domain.GetStr(s, fmt.Sprintf("item%dName", i), "")
 		qty := domain.GetInt(s, fmt.Sprintf("item%dQty", i), 0)
@@ -546,8 +549,8 @@ func (h *BotHandler) handleEquipMenu(c tele.Context) error {
 				break
 			}
 		}
-		if isGear && iName != curArmor && iName != curShield {
-			rows = append(rows, inline.Row(inline.Data("⬆️ Надеть: "+iName, "eq_on", strconv.Itoa(i))))
+		if isGear && iName != curArmor && iName != curMainHand && iName != curOffHand {
+			rows = append(rows, inline.Row(inline.Data("⬆️ Надеть / Взять: "+iName, "eq_on", strconv.Itoa(i))))
 		}
 	}
 
@@ -558,19 +561,24 @@ func (h *BotHandler) handleEquipMenu(c tele.Context) error {
 	if curArmor != "" {
 		armorText = curArmor
 	}
-	shieldText := "нет"
-	if curShield != "" && !strings.HasPrefix(curShield, "🔒") {
-		shieldText = fmt.Sprintf("%s (+%d КБ)", curShield, shieldBonus)
+	mainText := "пусто"
+	if curMainHand != "" {
+		mainText = curMainHand
+	}
+	offText := "пусто"
+	if curOffHand != "" {
+		offText = curOffHand
 	}
 
 	msg := fmt.Sprintf(
-		"🦺 *Управление экипировкой*\n"+
+		"🦺 *Управление экипировкой и оружием*\n"+
 			"━━━━━━━━━━━━━━━━━━━━\n"+
 			"🛡️ *Текущий КБ:* `%d`\n"+
 			"🧥 *Доспех:* %s\n"+
-			"🛡️ *Щит:* %s\n\n"+
+			"🗡️ *Правая рука:* %s\n"+
+			"🛡️ *Левая рука:* %s\n\n"+
 			"_Выберите действие ниже:_",
-		curAC, armorText, shieldText,
+		curAC, armorText, mainText, offText,
 	)
 
 	return c.Send(msg, inline, tele.ModeMarkdown)
