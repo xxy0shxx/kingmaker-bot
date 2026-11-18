@@ -19,14 +19,34 @@ func NewHeroRepository(db *pgxpool.Pool) *HeroRepository {
 }
 
 func (r *HeroRepository) BindTelegramToHero(ctx context.Context, linkCode string, tgUserID int64) (string, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Отвязываем этот Telegram ID от всех предыдущих героев
+	if _, err := tx.Exec(ctx, `
+		UPDATE public.campaign_heroes
+		SET telegram_user_id = NULL
+		WHERE telegram_user_id = $1
+	`, tgUserID); err != nil {
+		return "", err
+	}
+
+	// 2. Привязываем к новому герою по одноразовому коду
 	var rawJSON []byte
-	err := r.db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE public.campaign_heroes
 		SET telegram_user_id = $1, tg_link_code = NULL, updated_at = NOW()
 		WHERE tg_link_code = $2
 		RETURNING hero_data
 	`, tgUserID, linkCode).Scan(&rawJSON)
 	if err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
 
