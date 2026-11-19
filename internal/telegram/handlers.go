@@ -2006,9 +2006,8 @@ func (h *BotHandler) handleStatus(c tele.Context) error {
 			"🔄 <b>Вотчер релизов:</b> %s\n\n"+
 			"💬 <b>Привязанных групповых чатов:</b> <code>%d</code>\n"+
 			"🛡️ <b>Героев в базе:</b> <code>%d</code> (привязано к TG: <code>%d</code>)\n"+
+			"📬 <b>Очередь уведомлений:</b> <code>%d</code>"+
 			"📦 <b>Каталог магазина:</b> <code>%d</code> поз.\n"+
-			"📬 <b>Очередь уведомлений:</b> <code>%d</code>",
-		"📦 <b>Каталог магазина:</b> <code>%d</code> поз.\n"+
 			html.EscapeString(st.WebVersion), webUrlStatus,
 		html.EscapeString(st.BotVersion), botUrlStatus,
 		watcherState,
