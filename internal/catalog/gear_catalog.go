@@ -169,6 +169,9 @@ func (s *GearStore) Search(query string, kindFilter string) []GearItem {
 	var out []GearItem
 
 	for _, it := range s.items {
+		if isHiddenInShop(it) {
+			continue
+		}
 		if kindFilter != "" && kindFilter != "all" {
 			if kindFilter == "weapon" && it.Kind != "melee" && it.Kind != "ranged" {
 				continue
@@ -187,4 +190,14 @@ func (s *GearStore) Search(query string, kindFilter string) []GearItem {
 		}
 	}
 	return out
+}
+
+func isHiddenInShop(it GearItem) bool {
+	if it.ID == "normal_ingredients" || it.ID == "special_ingredients" {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(it.Category), "Привал") && it.PriceCp <= 0 {
+		return true
+	}
+	return false
 }
