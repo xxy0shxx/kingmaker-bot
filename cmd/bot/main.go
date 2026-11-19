@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"kingmaker-bot/internal/catalog"
 	"kingmaker-bot/internal/repository"
 	"kingmaker-bot/internal/telegram"
 	"kingmaker-bot/internal/watcher"
@@ -38,7 +39,11 @@ func main() {
 	}
 
 	repo := repository.NewHeroRepository(db)
-	handler := telegram.NewBotHandler(repo)
+
+	gearStore := catalog.NewGearStore(os.Getenv("GEAR_CATALOG_URL"), "gear_cache.json")
+	go gearStore.Start(ctx)
+
+	handler := telegram.NewBotHandler(repo, gearStore)
 	handler.Register(b)
 
 	mapWatcher := watcher.NewMapWatcher(repo, b)

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"kingmaker-bot/internal/catalog"
 	"kingmaker-bot/internal/domain"
 	"kingmaker-bot/internal/formatter"
 	"kingmaker-bot/internal/repository"
@@ -27,38 +28,45 @@ type pendingCoinTx struct {
 }
 
 type BotHandler struct {
-	repo             *repository.HeroRepository
-	mainMenu         *tele.ReplyMarkup
-	btnMe            tele.Btn
-	btnSpell         tele.Btn
-	btnEquip         tele.Btn
-	btnGive          tele.Btn
-	btnPay           tele.Btn
-	btnWeb           tele.Btn
-	pendingPays      sync.Map
-	lastMentionReply sync.Map
+	repo                *repository.HeroRepository
+	gear                *catalog.GearStore
+	mainMenu            *tele.ReplyMarkup
+	btnMe               tele.Btn
+	btnSpell            tele.Btn
+	btnEquip            tele.Btn
+	btnShop             tele.Btn
+	btnGive             tele.Btn
+	btnPay              tele.Btn
+	btnWeb              tele.Btn
+	pendingPays         sync.Map
+	pendingShopSearches sync.Map
+	lastMentionReply    sync.Map
 }
 
-func NewBotHandler(repo *repository.HeroRepository) *BotHandler {
+func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore) *BotHandler {
 	menu := &tele.ReplyMarkup{ResizeKeyboard: true}
 	btnMe := menu.Text("🛡️ Мой персонаж")
 	btnSpell := menu.Text("✨ Заклинания и рюкзак")
 	btnEquip := menu.Text("⚔️ Снаряжение")
+	btnShop := menu.Text("🏪 Магазин")
 	btnGive := menu.Text("🎁 Передать вещь")
 	btnPay := menu.Text("💸 Передать монеты")
 	btnWeb := menu.Text("🌐 Веб-лист и карта")
 	menu.Reply(
 		menu.Row(btnMe, btnSpell),
-		menu.Row(btnEquip, btnGive, btnPay),
+		menu.Row(btnEquip, btnShop),
+		menu.Row(btnGive, btnPay),
 		menu.Row(btnWeb),
 	)
 
 	return &BotHandler{
 		repo:     repo,
+		gear:     gear,
 		mainMenu: menu,
 		btnMe:    btnMe,
 		btnSpell: btnSpell,
 		btnEquip: btnEquip,
+		btnShop:  btnShop,
 		btnGive:  btnGive,
 		btnPay:   btnPay,
 		btnWeb:   btnWeb,
@@ -84,6 +92,13 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&tele.Btn{Unique: "eq_on"}, h.handleEquipFromBagAction)
 	b.Handle("/test_release", h.handleTestRelease)
 	b.Handle("/status", h.handleStatus)
+	b.Handle("/shop", h.handleShopMenu)
+	b.Handle(&h.btnShop, h.handleShopMenu)
+	b.Handle(&tele.Btn{Unique: "shop_home"}, h.handleShopHomeCallback)
+	b.Handle(&tele.Btn{Unique: "shop_cat"}, h.handleShopCategory)
+	b.Handle(&tele.Btn{Unique: "shop_find"}, h.handleShopSearchPrompt)
+	b.Handle(&tele.Btn{Unique: "shop_item"}, h.handleShopItemView)
+	b.Handle(&tele.Btn{Unique: "shop_buy"}, h.handleShopBuyExec)
 
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
@@ -94,6 +109,7 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&tele.Btn{Unique: "tr_cancel"}, func(c tele.Context) error {
 		_ = c.Respond()
 		h.pendingPays.Delete(c.Sender().ID)
+		h.pendingShopSearches.Delete(c.Sender().ID)
 		return c.Edit("❌ Операция отменена.")
 	})
 
@@ -462,6 +478,15 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 			h.mainMenu,
 			tele.ModeMarkdown,
 		)
+	}
+	if _, searching := h.pendingShopSearches.Load(tgID); searching {
+		q := strings.TrimSpace(c.Text())
+		if q == "" || strings.HasPrefix(q, "/") {
+			h.pendingShopSearches.Delete(tgID)
+			return nil
+		}
+		h.pendingShopSearches.Delete(tgID)
+		return h.sendShopSearchResults(c, q, 0)
 	}
 
 	text := strings.TrimSpace(c.Text())
@@ -1968,6 +1993,11 @@ func (h *BotHandler) handleStatus(c tele.Context) error {
 		botUrlStatus = "⚠️ не задан"
 	}
 
+	gearCount := 0
+	if h.gear != nil {
+		gearCount = h.gear.Count()
+	}
+
 	msg := fmt.Sprintf(
 		"📊 <b>Статус системы Kingmaker Bot</b>\n"+
 			"━━━━━━━━━━━━━━━━━━━━\n"+
@@ -1976,12 +2006,15 @@ func (h *BotHandler) handleStatus(c tele.Context) error {
 			"🔄 <b>Вотчер релизов:</b> %s\n\n"+
 			"💬 <b>Привязанных групповых чатов:</b> <code>%d</code>\n"+
 			"🛡️ <b>Героев в базе:</b> <code>%d</code> (привязано к TG: <code>%d</code>)\n"+
+			"📦 <b>Каталог магазина:</b> <code>%d</code> поз.\n"+
 			"📬 <b>Очередь уведомлений:</b> <code>%d</code>",
-		html.EscapeString(st.WebVersion), webUrlStatus,
+		"📦 <b>Каталог магазина:</b> <code>%d</code> поз.\n"+
+			html.EscapeString(st.WebVersion), webUrlStatus,
 		html.EscapeString(st.BotVersion), botUrlStatus,
 		watcherState,
 		st.TrackedChats,
 		st.TotalHeroes, st.LinkedHeroes,
+		gearCount,
 		st.PendingQueue,
 	)
 
@@ -2013,4 +2046,325 @@ func IsAdmin(userID int64) bool {
 		}
 	}
 	return false
+}
+
+// --- Магазин снаряжения ---
+
+func (h *BotHandler) buildShopHomeView(ctx context.Context, tgID int64) (string, *tele.ReplyMarkup, error) {
+	hero, err := h.repo.GetHeroByTgID(ctx, tgID)
+	if err != nil {
+		return "", nil, fmt.Errorf("⚠️ Персонаж не привязан. Перейдите по ссылке привязки от Мастера.")
+	}
+	if hero.IsReadOnly {
+		return "", nil, fmt.Errorf("🔒 Мастер заблокировал ваш лист (режим Read-Only). Покупки недоступны.")
+	}
+
+	isOpen, err := h.repo.IsShopOpen(ctx, hero.RoomCode)
+	if err != nil || !isOpen {
+		return "", nil, fmt.Errorf("🔒 <b>Магазин сейчас закрыт Мастером.</b>\nДождитесь прибытия в поселение или открытия лавки.")
+	}
+
+	if h.gear == nil || h.gear.Count() == 0 {
+		return "", nil, fmt.Errorf("⚠️ Каталог товаров временно недоступен.")
+	}
+
+	s := hero.Stats()
+	gp := domain.GetInt(s, "coinsGold", 0)
+	sp := domain.GetInt(s, "coinsSilver", 0)
+	cp := domain.GetInt(s, "coinsCopper", 0)
+
+	freeSlots := 0
+	for i := 1; i <= 15; i++ {
+		if strings.TrimSpace(domain.GetStr(s, fmt.Sprintf("item%dName", i), "")) == "" {
+			freeSlots++
+		}
+	}
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(
+		inline.Row(inline.Data("🔍 Поиск по названию", "shop_find", "1")),
+		inline.Row(inline.Data("🧪 Зелья, свитки и расходники", "shop_cat", "item|0")),
+		inline.Row(inline.Data("🧥 Броня и доспехи", "shop_cat", "armor|0")),
+		inline.Row(inline.Data("⚔️ Оружие (ближнее и дальнее)", "shop_cat", "weapon|0")),
+		inline.Row(inline.Data("📦 Все товары каталога", "shop_cat", "all|0")),
+		inline.Row(inline.Data("✖ Закрыть лавку", "tr_cancel", "0")),
+	)
+
+	text := fmt.Sprintf(
+		"🏪 <b>Лавка снаряжения открыта!</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"🛡️ <b>Покупатель:</b> %s\n"+
+			"💰 <b>Кошелёк:</b> <code>%d ЗМ • %d СМ • %d ММ</code>\n"+
+			"🎒 <b>Свободно в рюкзаке:</b> <code>%d / 15</code> слотов\n\n"+
+			"<i>Выберите раздел каталога или воспользуйтесь поиском:</i>",
+		html.EscapeString(domain.GetStr(hero.Data, "name", "Герой")),
+		gp, sp, cp, freeSlots,
+	)
+
+	return text, inline, nil
+}
+
+func (h *BotHandler) handleShopMenu(c tele.Context) error {
+	tgID := c.Sender().ID
+	h.pendingPays.Delete(tgID)
+	h.pendingShopSearches.Delete(tgID)
+
+	text, markup, err := h.buildShopHomeView(context.Background(), tgID)
+	if err != nil {
+		return c.Send(err.Error(), h.mainMenu, tele.ModeHTML)
+	}
+	return c.Send(text, markup, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleShopHomeCallback(c tele.Context) error {
+	_ = c.Respond()
+	tgID := c.Sender().ID
+	h.pendingShopSearches.Delete(tgID)
+
+	text, markup, err := h.buildShopHomeView(context.Background(), tgID)
+	if err != nil {
+		return c.Edit(err.Error(), tele.ModeHTML)
+	}
+	return c.Edit(text, markup, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleShopSearchPrompt(c tele.Context) error {
+	_ = c.Respond()
+	tgID := c.Sender().ID
+	h.pendingShopSearches.Store(tgID, true)
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(inline.Row(inline.Data("⬅️ Назад в магазин", "shop_home", "0")))
+	return c.Edit(
+		"🔍 <b>Поиск по каталогу магазина</b>\n\nНапишите название предмета, брони или оружия в чат (например: <code>исцеления</code>, <code>кольчуг</code>, <code>длинный меч</code>, <code>щит</code>):",
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) sendShopSearchResults(c tele.Context, query string, page int) error {
+	items := h.gear.Search(query, "all")
+	if len(items) == 0 {
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(
+			inline.Row(inline.Data("🔍 Искать снова", "shop_find", "1")),
+			inline.Row(inline.Data("⬅️ В меню магазина", "shop_home", "0")),
+		)
+		return c.Send(fmt.Sprintf("😔 По запросу «<b>%s</b>» ничего не найдено.", html.EscapeString(query)), inline, tele.ModeHTML)
+	}
+
+	const pageSize = 8
+	if len(items) > pageSize {
+		items = items[:pageSize]
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, it := range items {
+		priceLabel := it.Price
+		if priceLabel == "" {
+			priceLabel = "0 ММ"
+		}
+		btnText := fmt.Sprintf("%s — %s", it.Name, priceLabel)
+		rows = append(rows, inline.Row(inline.Data(btnText, "shop_item", it.ID+"|all|0")))
+	}
+	rows = append(rows, inline.Row(
+		inline.Data("🔍 Новый поиск", "shop_find", "1"),
+		inline.Data("⬅️ В магазин", "shop_home", "0"),
+	))
+	inline.Inline(rows...)
+
+	return c.Send(
+		fmt.Sprintf("🔍 <b>Результаты поиска по запросу «%s»:</b>", html.EscapeString(query)),
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleShopCategory(c tele.Context) error {
+	_ = c.Respond()
+	kind, pageStr, ok := strings.Cut(c.Callback().Data, "|")
+	if !ok {
+		return c.Edit("❌ Ошибка навигации.")
+	}
+	page, _ := strconv.Atoi(pageStr)
+	if page < 0 {
+		page = 0
+	}
+
+	items := h.gear.Search("", kind)
+	if len(items) == 0 {
+		return c.Edit("⚠️ В этом разделе пока пусто.")
+	}
+
+	const pageSize = 8
+	totalPages := (len(items) + pageSize - 1) / pageSize
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+
+	start := page * pageSize
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	for _, it := range items[start:end] {
+		priceLabel := it.Price
+		if priceLabel == "" {
+			priceLabel = "0 ММ"
+		}
+		btnText := fmt.Sprintf("%s — %s", it.Name, priceLabel)
+		rows = append(rows, inline.Row(inline.Data(btnText, "shop_item", fmt.Sprintf("%s|%s|%d", it.ID, kind, page))))
+	}
+
+	var navBtns []tele.Btn
+	if page > 0 {
+		navBtns = append(navBtns, inline.Data("⬅️ Назад", "shop_cat", fmt.Sprintf("%s|%d", kind, page-1)))
+	}
+	if page+1 < totalPages {
+		navBtns = append(navBtns, inline.Data("Вперёд ➡️", "shop_cat", fmt.Sprintf("%s|%d", kind, page+1)))
+	}
+	if len(navBtns) > 0 {
+		rows = append(rows, inline.Row(navBtns...))
+	}
+
+	rows = append(rows, inline.Row(inline.Data("⬅️ В меню магазина", "shop_home", "0")))
+	inline.Inline(rows...)
+
+	catTitles := map[string]string{
+		"item":   "🧪 Зелья, свитки и расходники",
+		"armor":  "🧥 Броня и доспехи",
+		"weapon": "⚔️ Оружие",
+		"all":    "📦 Весь каталог",
+	}
+	title := catTitles[kind]
+	if title == "" {
+		title = "🏪 Каталог"
+	}
+
+	return c.Edit(
+		fmt.Sprintf("<b>%s</b> (стр. %d из %d)\n<i>Нажмите на товар, чтобы посмотреть описание и купить:</i>", title, page+1, totalPages),
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) findGearByID(id string) *catalog.GearItem {
+	if h.gear == nil {
+		return nil
+	}
+	for _, it := range h.gear.All() {
+		if it.ID == id {
+			cp := it
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (h *BotHandler) handleShopItemView(c tele.Context) error {
+	_ = c.Respond()
+	parts := strings.Split(c.Callback().Data, "|")
+	if len(parts) < 3 {
+		return c.Edit("❌ Ошибка карточки товара.")
+	}
+	itemID, backKind, backPage := parts[0], parts[1], parts[2]
+
+	item := h.findGearByID(itemID)
+	if item == nil {
+		return c.Edit("⚠️ Товар не найден в каталоге.")
+	}
+
+	hero, err := h.repo.GetHeroByTgID(context.Background(), c.Sender().ID)
+	if err != nil {
+		return c.Edit("⚠️ Персонаж не привязан.")
+	}
+
+	s := hero.Stats()
+	gp := domain.GetInt(s, "coinsGold", 0)
+	sp := domain.GetInt(s, "coinsSilver", 0)
+	cp := domain.GetInt(s, "coinsCopper", 0)
+	availCp := gp*100 + sp*10 + cp
+
+	priceLabel := item.Price
+	if priceLabel == "" {
+		priceLabel = "Бесплатно (0 ММ)"
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	if availCp >= item.PriceCp {
+		rows = append(rows, inline.Row(inline.Data(fmt.Sprintf("🛒 Купить за %s", priceLabel), "shop_buy", item.ID)))
+	}
+
+	rows = append(rows, inline.Row(
+		inline.Data("⬅️ К списку", "shop_cat", fmt.Sprintf("%s|%s", backKind, backPage)),
+		inline.Data("🏪 В магазин", "shop_home", "0"),
+	))
+	inline.Inline(rows...)
+
+	affordLine := fmt.Sprintf("💰 <b>Ваш кошелёк:</b> <code>%d ЗМ • %d СМ • %d ММ</code>", gp, sp, cp)
+	if availCp < item.PriceCp {
+		affordLine += "\n⚠️ <i>Недостаточно монет для покупки.</i>"
+	}
+
+	msg := fmt.Sprintf(
+		"🏷️ <b>%s</b>\n"+
+			"📂 <i>%s</i>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"%s\n\n"+
+			"💵 <b>Цена:</b> <code>%s</code>\n%s",
+		html.EscapeString(item.Name),
+		html.EscapeString(item.Category),
+		html.EscapeString(item.Notes),
+		html.EscapeString(priceLabel),
+		affordLine,
+	)
+
+	return c.Edit(msg, inline, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleShopBuyExec(c tele.Context) error {
+	_ = c.Respond()
+	itemID := strings.TrimSpace(c.Callback().Data)
+	item := h.findGearByID(itemID)
+	if item == nil {
+		return c.Edit("⚠️ Товар не найден.")
+	}
+
+	priceLabel := item.Price
+	if priceLabel == "" {
+		priceLabel = "0 ММ"
+	}
+
+	res, err := h.repo.BuyItemFromShop(context.Background(), c.Sender().ID, item.Name, item.Notes, priceLabel, item.PriceCp)
+	if err != nil {
+		return c.Edit(fmt.Sprintf("❌ Не удалось купить товар: %s", html.EscapeString(err.Error())), tele.ModeHTML)
+	}
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(inline.Row(
+		inline.Data("🏪 Продолжить покупки", "shop_home", "0"),
+		inline.Data("✖ Закрыть", "tr_cancel", "0"),
+	))
+
+	return c.Edit(
+		fmt.Sprintf(
+			"✅ <b>Покупка совершена!</b>\n"+
+				"🎒 Предмет <b>%s</b> добавлен в рюкзак героя <b>%s</b>.\n"+
+				"💸 Списано: <code>%s</code>\n"+
+				"💰 Остаток в кошельке: <code>%d ЗМ • %d СМ • %d ММ</code>",
+			html.EscapeString(res.ItemName),
+			html.EscapeString(res.HeroName),
+			html.EscapeString(res.PriceText),
+			res.RemGold, res.RemSilver, res.RemCopper,
+		),
+		inline,
+		tele.ModeHTML,
+	)
 }

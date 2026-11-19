@@ -872,3 +872,115 @@ func returnGearToStatsBackpack(stats map[string]any, itemName, itemNotes string)
 	stats[fmt.Sprintf("item%dNotes", emptySlot)] = itemNotes
 	return true
 }
+
+// IsShopOpen проверяет, открыт ли магазин Мастером в текущей комнате кампании
+func (r *HeroRepository) IsShopOpen(ctx context.Context, roomCode string) (bool, error) {
+	var rawJSON []byte
+	err := r.db.QueryRow(ctx, `
+		SELECT map_data FROM public.campaign_state WHERE room_code = $1 LIMIT 1
+	`, roomCode).Scan(&rawJSON)
+	if err != nil {
+		return false, err
+	}
+	var mapData map[string]any
+	if err := json.Unmarshal(rawJSON, &mapData); err != nil {
+		return false, err
+	}
+	if bst, ok := mapData["bestiary"].(map[string]any); ok {
+		if open, ok := bst["isShopOpen"].(bool); ok {
+			return open, nil
+		}
+	}
+	return false, nil
+}
+
+type ShopPurchaseResult struct {
+	HeroName  string
+	ItemName  string
+	PriceText string
+	RemGold   int
+	RemSilver int
+	RemCopper int
+}
+
+// BuyItemFromShop списывает монеты (с авторазменом) и кладёт купленный предмет в рюкзак героя
+func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemName, itemNotes, priceText string, priceCp int) (*ShopPurchaseResult, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var heroID, roomCode string
+	var isReadOnly bool
+	var rawJSON []byte
+	err = tx.QueryRow(ctx, `
+		SELECT id, room_code, is_readonly, hero_data
+		FROM public.campaign_heroes
+		WHERE telegram_user_id = $1
+		FOR UPDATE
+	`, tgID).Scan(&heroID, &roomCode, &isReadOnly, &rawJSON)
+	if err != nil {
+		return nil, fmt.Errorf("персонаж не привязан")
+	}
+	if isReadOnly {
+		return nil, fmt.Errorf("лист персонажа заблокирован Мастером (Read-Only)")
+	}
+
+	isOpen, err := r.IsShopOpen(ctx, roomCode)
+	if err != nil || !isOpen {
+		return nil, fmt.Errorf("магазин сейчас закрыт Мастером")
+	}
+
+	var heroData map[string]any
+	if err := json.Unmarshal(rawJSON, &heroData); err != nil {
+		return nil, err
+	}
+	stats := ensureStatsMap(heroData)
+
+	curG := domain.GetInt(stats, "coinsGold", 0)
+	curS := domain.GetInt(stats, "coinsSilver", 0)
+	curC := domain.GetInt(stats, "coinsCopper", 0)
+	availCp := curG*100 + curS*10 + curC
+
+	if priceCp > availCp {
+		return nil, fmt.Errorf("недостаточно монет (у вас %d ЗМ %d СМ %d ММ)", curG, curS, curC)
+	}
+
+	if !returnGearToStatsBackpack(stats, itemName, itemNotes) {
+		return nil, fmt.Errorf("рюкзак полностью заполнен (15/15 слотов)")
+	}
+
+	remCp := availCp - priceCp
+	remG := remCp / 100
+	remS := (remCp % 100) / 10
+	remC := remCp % 10
+
+	stats["coinsGold"] = remG
+	stats["coinsSilver"] = remS
+	stats["coinsCopper"] = remC
+
+	newBytes, err := json.Marshal(heroData)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE public.campaign_heroes SET hero_data = $1::jsonb, updated_at = NOW() WHERE id = $2
+	`, string(newBytes), heroID); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return &ShopPurchaseResult{
+		HeroName:  domain.GetStr(heroData, "name", "Герой"),
+		ItemName:  itemName,
+		PriceText: priceText,
+		RemGold:   remG,
+		RemSilver: remS,
+		RemCopper: remC,
+	}, nil
+}
