@@ -2,15 +2,15 @@ package main
 
 import (
 	"context"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"kingmaker-bot/internal/watcher"
 	"log"
 	"os"
 	"time"
 
 	"kingmaker-bot/internal/repository"
 	"kingmaker-bot/internal/telegram"
+	"kingmaker-bot/internal/watcher"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	tele "gopkg.in/telebot.v3"
 )
 

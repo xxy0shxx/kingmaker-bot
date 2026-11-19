@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"strings"
 
 	"kingmaker-bot/internal/domain"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type HeroRepository struct {

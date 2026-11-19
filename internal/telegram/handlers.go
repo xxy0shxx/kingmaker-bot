@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"html"
-	"kingmaker-bot/internal/watcher"
 	"log"
 	"os"
 	"regexp"
@@ -15,6 +14,7 @@ import (
 	"kingmaker-bot/internal/domain"
 	"kingmaker-bot/internal/formatter"
 	"kingmaker-bot/internal/repository"
+	"kingmaker-bot/internal/watcher"
 
 	tele "gopkg.in/telebot.v3"
 )
