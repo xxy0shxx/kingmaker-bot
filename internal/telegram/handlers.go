@@ -1726,7 +1726,7 @@ func (h *BotHandler) handleEquipMenu(c tele.Context) error {
 	curOffHand := domain.GetStr(s, "eq_offHand_Name", "")
 	shieldBonus := domain.GetInt(s, "acShieldBonus", 0)
 	if curOffHand == "" && shieldBonus > 0 {
-		curOffHand = fmt.Sprintf("Щит (+%d КБ)", shieldBonus)
+		curOffHand = fmt.Sprintf("Щит (+%d при поднятии)", shieldBonus)
 	}
 	curAC := domain.GetInt(s, "ac", 10)
 

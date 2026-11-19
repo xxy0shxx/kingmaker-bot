@@ -68,7 +68,7 @@ func FormatPage1(h *domain.HeroRecord) string {
 		}
 		if shieldBonus > 0 {
 			shieldHp := domain.GetInt(s, "acShieldHp", 0)
-			defParts = append(defParts, fmt.Sprintf("🛡️ Щит +%d КБ (ПЗ %d)", shieldBonus, shieldHp))
+			defParts = append(defParts, fmt.Sprintf("🛡️ Щит (+%d при поднятии, ПЗ %d)", shieldBonus, shieldHp))
 		}
 		sb.WriteString(strings.Join(defParts, " • ") + "\n")
 	}
