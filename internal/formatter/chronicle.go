@@ -302,3 +302,160 @@ func sliceAt(s []string, idx int) string {
 	}
 	return ""
 }
+
+// FormatQuestCompletedChronicle формирует праздничный анонс завершения задания в групповом чате
+func FormatQuestCompletedChronicle(hexID string, hexData map[string]any, questData map[string]any) string {
+	coords := formatHexCoords(hexID)
+	hexTitle := domain.GetStr(hexData, "title", "")
+	qTitle := domain.GetStr(questData, "title", "Неизвестное задание")
+	qDesc := domain.GetStr(questData, "desc", "")
+
+	locLabel := fmt.Sprintf("Сектор %s", coords)
+	if hexTitle != "" {
+		locLabel = fmt.Sprintf("*%s* %s", hexTitle, coords)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("🏆 *ЗАДАНИЕ ВЫПОЛНЕНО!* 🏆\n")
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("⚜️ *Квест:* «%s»\n", qTitle))
+	sb.WriteString(fmt.Sprintf("📍 *Локация:* %s\n", locLabel))
+
+	if qDesc != "" {
+		sb.WriteString(fmt.Sprintf("\n📖 _%s_\n", qDesc))
+	}
+
+	outros := []string{
+		"Слава о подвигах отряда разносится по всем Украденным землям!",
+		"Ещё одна опасность устранена, а легенда героев стала ярче!",
+		"Летописцы занесли это свершение в хроники королевства!",
+		"Награда и почёт ждут смелых искателей приключений!",
+	}
+	sb.WriteString(fmt.Sprintf("\n✨ _%s_", pickRandom(outros)))
+	return sb.String()
+}
+
+// FormatHexClaimedChronicle формирует героический анонс присоединения нового гекса к королевству
+func FormatHexClaimedChronicle(hexID string, hexData map[string]any, mapData map[string]any) string {
+	coords := formatHexCoords(hexID)
+	hexTitle := domain.GetStr(hexData, "title", "")
+	terrain := domain.GetStr(hexData, "terrain", "plains")
+	workSite := domain.GetStr(hexData, "workSite", "none")
+
+	kingdomName := "Королевства"
+	if kData, ok := mapData["kingdom"].(map[string]any); ok && kData != nil {
+		if kName := domain.GetStr(kData, "kingdomName", domain.GetStr(kData, "name", "")); kName != "" {
+			kingdomName = fmt.Sprintf("«%s»", kName)
+		}
+	}
+
+	locLabel := fmt.Sprintf("Сектор %s", coords)
+	if hexTitle != "" {
+		locLabel = fmt.Sprintf("*%s* %s", hexTitle, coords)
+	}
+
+	terrainRu := map[string]string{
+		"plains":   "🌾 Плодородные равнины",
+		"forest":   "🌲 Лесные угодья",
+		"swamp":    "🐸 Осушаемые топи",
+		"hills":    "⛰️ Холмистые рубежи",
+		"mountain": "🏔️ Богатые недрами горы",
+		"water":    "🌊 Прибрежные воды",
+		"arctic":   "❄️ Северные пустоши",
+	}
+
+	var sb strings.Builder
+	sb.WriteString("👑 *РАСШИРЕНИЕ ГРАНИЦ КОРОЛЕВСТВА!* 👑\n")
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("_Знамёна %s гордо взвились над новыми землями!_\n\n", kingdomName))
+	sb.WriteString(fmt.Sprintf("📍 *Присоединённый сектор:* %s\n", locLabel))
+
+	if tName, ok := terrainRu[terrain]; ok {
+		sb.WriteString(fmt.Sprintf("🗺️ *Ландшафт:* %s\n", tName))
+	}
+
+	if hasRoadHex(hexData) {
+		sb.WriteString("🛣️ *Инфраструктура:* через сектор проходит торговый тракт\n")
+	}
+
+	wsLabels := map[string]string{
+		"farmlands":   "🌾 Ферма (производство Еды)",
+		"lumberCamps": "🪵 Лесопилка (добыча Дерева)",
+		"mines":       "⚒️ Шахта (добыча Руды)",
+		"quarries":    "🧱 Каменоломня (добыча Камня)",
+	}
+	if wsName, ok := wsLabels[workSite]; ok {
+		sb.WriteString(fmt.Sprintf("🏗️ *Участок:* %s\n", wsName))
+	}
+
+	outros := []string{
+		"Да процветают новые рубежи под мудрой рукой правителей!",
+		"Картографы уже перенесли золотые границы на карту мира!",
+		"Ещё один край Украденных земель обрёл закон и защиту!",
+		"Слава первопроходцам и строителям великой державы!",
+	}
+	sb.WriteString(fmt.Sprintf("\n✨ _%s_", pickRandom(outros)))
+	return sb.String()
+}
+
+// FormatWorkSiteBuiltChronicle формирует анонс строительства добывающего участка королевства
+func FormatWorkSiteBuiltChronicle(hexID string, hexData map[string]any, workSite string, mapData map[string]any) string {
+	coords := formatHexCoords(hexID)
+	hexTitle := domain.GetStr(hexData, "title", "")
+
+	kingdomName := "Королевства"
+	if kData, ok := mapData["kingdom"].(map[string]any); ok && kData != nil {
+		if kName := domain.GetStr(kData, "kingdomName", domain.GetStr(kData, "name", "")); kName != "" {
+			kingdomName = fmt.Sprintf("«%s»", kName)
+		}
+	}
+
+	locLabel := fmt.Sprintf("Сектор %s", coords)
+	if hexTitle != "" {
+		locLabel = fmt.Sprintf("*%s* %s", hexTitle, coords)
+	}
+
+	siteDetails := map[string]struct {
+		Title  string
+		Effect string
+	}{
+		"farmlands": {
+			Title:  "🌾 Фермерские угодья (Ферма)",
+			Effect: "Увеличивает производство Еды и снижает потребление припасов в фазу содержания.",
+		},
+		"lumberCamps": {
+			Title:  "🪵 Лесопильный лагерь (Лесопилка)",
+			Effect: "Обеспечивает регулярную добычу Дерева для строительства поселений и дорог.",
+		},
+		"mines": {
+			Title:  "⚒️ Рудная шахта (Шахта)",
+			Effect: "Открывает добычу Руды для кузниц, вооружения и развития ремёсел королевства.",
+		},
+		"quarries": {
+			Title:  "🧱 Каменный карьер (Каменоломня)",
+			Effect: "Поставляет строительный Камень для возведения укреплений и монументальных зданий.",
+		},
+	}
+
+	info, ok := siteDetails[workSite]
+	if !ok {
+		info.Title = "🏗️ Добывающий участок"
+		info.Effect = "Укрепляет экономическую базу и ресурсный потенциал владений."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("🏗️ *НОВЫЙ ДОБЫВАЮЩИЙ УЧАСТОК!* 🏗️\n")
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("_В землях %s завершено обустройство нового промысла!_\n\n", kingdomName))
+	sb.WriteString(fmt.Sprintf("🏛️ *Постройка:* %s\n", info.Title))
+	sb.WriteString(fmt.Sprintf("📍 *Локация:* %s\n", locLabel))
+	sb.WriteString(fmt.Sprintf("📈 *Польза:* _%s_\n", info.Effect))
+
+	outros := []string{
+		"Казна и склады королевства будут пополняться с каждым новым месяцем!",
+		"Трудом поселенцев и мудростью правителей дикий край становится оплотом цивилизации!",
+		"Мастера и рабочие уже приступили к добыче ресурсов!",
+	}
+	sb.WriteString(fmt.Sprintf("\n✨ _%s_", pickRandom(outros)))
+	return sb.String()
+}
