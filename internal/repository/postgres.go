@@ -827,3 +827,24 @@ func (r *HeroRepository) PopPendingNotifications(ctx context.Context) ([]TgNotif
 	}
 	return list, nil
 }
+
+func (r *HeroRepository) GetLastAnnouncedVersion(ctx context.Context, repoKey string) (string, error) {
+	var ver string
+	err := r.db.QueryRow(ctx, `
+		SELECT last_version FROM public.bot_release_state WHERE repo_key = $1
+	`, repoKey).Scan(&ver)
+	if err != nil {
+		return "", nil
+	}
+	return ver, nil
+}
+
+func (r *HeroRepository) SaveLastAnnouncedVersion(ctx context.Context, repoKey, version string) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO public.bot_release_state (repo_key, last_version, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (repo_key)
+		DO UPDATE SET last_version = EXCLUDED.last_version, updated_at = NOW()
+	`, repoKey, version)
+	return err
+}

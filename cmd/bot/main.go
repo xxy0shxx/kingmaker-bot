@@ -44,6 +44,9 @@ func main() {
 	mapWatcher := watcher.NewMapWatcher(repo, b)
 	go mapWatcher.Start(ctx)
 
+	releaseWatcher := watcher.NewReleaseWatcher(repo, b)
+	go releaseWatcher.Start(ctx)
+
 	log.Println("Бот запущен и готов к работе...")
 	b.Start()
 }

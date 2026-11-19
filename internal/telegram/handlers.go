@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"kingmaker-bot/internal/watcher"
 	"log"
 	"os"
 	"regexp"
@@ -77,6 +78,7 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&h.btnEquip, h.handleEquipMenu)
 	b.Handle(&tele.Btn{Unique: "eq_off"}, h.handleUnequipAction)
 	b.Handle(&tele.Btn{Unique: "eq_on"}, h.handleEquipFromBagAction)
+	b.Handle("/test_release", h.handleTestRelease)
 
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
@@ -611,4 +613,24 @@ func (h *BotHandler) handleEquipFromBagAction(c tele.Context) error {
 		fmt.Sprintf("✅ Вы надели *%s*!\n🛡️ Новый итоговый КБ: *%d*", equippedName, newAC),
 		tele.ModeMarkdown,
 	)
+}
+
+func (h *BotHandler) handleTestRelease(c tele.Context) error {
+	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
+	if adminID != 0 && c.Sender().ID != adminID {
+		return c.Send("⛔ Эта команда доступна только Мастеру кампании.")
+	}
+
+	rw := watcher.NewReleaseWatcher(h.repo, c.Bot())
+	messages, err := rw.FetchLatestFormatted(context.Background())
+	if err != nil || len(messages) == 0 {
+		return c.Send("⚠️ Не заданы ссылки WEB_CHANGELOG_URL / BOT_CHANGELOG_URL в .env")
+	}
+
+	for _, msg := range messages {
+		if err := c.Send(msg, tele.ModeHTML); err != nil {
+			_ = c.Send(fmt.Sprintf("❌ Ошибка отправки HTML: %v", err))
+		}
+	}
+	return nil
 }
