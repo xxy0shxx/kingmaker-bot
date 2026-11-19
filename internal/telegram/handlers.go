@@ -551,7 +551,7 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 	return nil
 }
 
-var berestaRuleTriggerRegex = regexp.MustCompile(`(?i)(?:правил[аоуеы]?|состояни[еяю]|что такое|как работает|механик[ауе])\s+(.+)$`)
+var berestaRuleTriggerRegex = regexp.MustCompile(`(?i)(?:правил[аоуеы]?|состояни[еяю]|что такое|как работает|механик[ауе]|расскажи про|подскажи про|про)\s+(.+)$`)
 
 func extractBerestaRuleQuery(text string) (string, bool) {
 	clean := strings.TrimSpace(strings.TrimRight(text, "?!."))
