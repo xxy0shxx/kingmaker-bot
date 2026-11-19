@@ -2005,7 +2005,7 @@ func GetAdminIDs() []int64 {
 func IsAdmin(userID int64) bool {
 	admins := GetAdminIDs()
 	if len(admins) == 0 {
-		return true
+		return false
 	}
 	for _, id := range admins {
 		if id == userID {
