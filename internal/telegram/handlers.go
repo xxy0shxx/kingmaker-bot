@@ -146,7 +146,7 @@ func (h *BotHandler) handleBindChat(c tele.Context) error {
 
 	roomCode := strings.TrimSpace(c.Message().Payload)
 	if roomCode == "" {
-		return c.Send("⚠️ Укажите код комнаты. Пример: `/bind_chat room_w9utas`", tele.ModeMarkdown)
+		return c.Send("⚠️ Укажите код комнаты. Пример: `/bind_chat room_123`", tele.ModeMarkdown)
 	}
 
 	if err := h.repo.BindGroupChat(context.Background(), roomCode, c.Chat().ID); err != nil {
