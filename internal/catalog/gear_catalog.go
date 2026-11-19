@@ -161,7 +161,7 @@ func (s *GearStore) All() []GearItem {
 	return cp
 }
 
-func (s *GearStore) Search(query string, kindFilter string) []GearItem {
+func (s *GearStore) Search(query string, kindFilter string, maxLevel int) []GearItem {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -169,7 +169,7 @@ func (s *GearStore) Search(query string, kindFilter string) []GearItem {
 	var out []GearItem
 
 	for _, it := range s.items {
-		if isHiddenInShop(it) {
+		if isHiddenInShop(it, maxLevel) {
 			continue
 		}
 		if kindFilter != "" && kindFilter != "all" {
@@ -192,12 +192,21 @@ func (s *GearStore) Search(query string, kindFilter string) []GearItem {
 	return out
 }
 
-func isHiddenInShop(it GearItem) bool {
+func isHiddenInShop(it GearItem, maxLevel int) bool {
 	if it.ID == "normal_ingredients" || it.ID == "special_ingredients" {
 		return true
 	}
 	if strings.EqualFold(strings.TrimSpace(it.Category), "Привал") && it.PriceCp <= 0 {
 		return true
+	}
+	if maxLevel > 0 && it.Level > maxLevel {
+		return true
+	}
+	if maxLevel > 0 && maxLevel < 20 {
+		meta := strings.ToLower(it.Category + " " + it.Traits)
+		if strings.Contains(meta, "необычн") || strings.Contains(meta, "экзотическ") {
+			return true
+		}
 	}
 	return false
 }

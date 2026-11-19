@@ -2049,6 +2049,14 @@ func IsAdmin(userID int64) bool {
 
 // --- Магазин снаряжения ---
 
+func (h *BotHandler) getHeroShopMaxLevel(ctx context.Context, tgID int64) (int, error) {
+	hero, err := h.repo.GetHeroByTgID(ctx, tgID)
+	if err != nil {
+		return 0, err
+	}
+	return h.repo.GetShopMaxLevel(ctx, hero.RoomCode)
+}
+
 func (h *BotHandler) buildShopHomeView(ctx context.Context, tgID int64) (string, *tele.ReplyMarkup, error) {
 	hero, err := h.repo.GetHeroByTgID(ctx, tgID)
 	if err != nil {
@@ -2058,8 +2066,8 @@ func (h *BotHandler) buildShopHomeView(ctx context.Context, tgID int64) (string,
 		return "", nil, fmt.Errorf("🔒 Мастер заблокировал ваш лист (режим Read-Only). Покупки недоступны.")
 	}
 
-	isOpen, err := h.repo.IsShopOpen(ctx, hero.RoomCode)
-	if err != nil || !isOpen {
+	maxLvl, err := h.repo.GetShopMaxLevel(ctx, hero.RoomCode)
+	if err != nil || maxLvl <= 0 {
 		return "", nil, fmt.Errorf("🔒 <b>Магазин сейчас закрыт Мастером.</b>\nДождитесь прибытия в поселение или открытия лавки.")
 	}
 
@@ -2085,17 +2093,18 @@ func (h *BotHandler) buildShopHomeView(ctx context.Context, tgID int64) (string,
 		inline.Row(inline.Data("🧪 Зелья, свитки и расходники", "shop_cat", "item|0")),
 		inline.Row(inline.Data("🧥 Броня и доспехи", "shop_cat", "armor|0")),
 		inline.Row(inline.Data("⚔️ Оружие (ближнее и дальнее)", "shop_cat", "weapon|0")),
-		inline.Row(inline.Data("📦 Все товары каталога", "shop_cat", "all|0")),
+		inline.Row(inline.Data("📦 Все товары лавки", "shop_cat", "all|0")),
 		inline.Row(inline.Data("✖ Закрыть лавку", "tr_cancel", "0")),
 	)
 
 	text := fmt.Sprintf(
-		"🏪 <b>Лавка снаряжения открыта!</b>\n"+
+		"🏪 <b>Лавка снаряжения открыта (товары до %d ур.)</b>\n"+
 			"━━━━━━━━━━━━━━━━━━━━\n"+
 			"🛡️ <b>Покупатель:</b> %s\n"+
 			"💰 <b>Кошелёк:</b> <code>%d ЗМ • %d СМ • %d ММ</code>\n"+
 			"🎒 <b>Свободно в рюкзаке:</b> <code>%d / 15</code> слотов\n\n"+
 			"<i>Выберите раздел каталога или воспользуйтесь поиском:</i>",
+		maxLvl,
 		html.EscapeString(domain.GetStr(hero.Data, "name", "Герой")),
 		gp, sp, cp, freeSlots,
 	)
@@ -2142,14 +2151,19 @@ func (h *BotHandler) handleShopSearchPrompt(c tele.Context) error {
 }
 
 func (h *BotHandler) sendShopSearchResults(c tele.Context, query string, page int) error {
-	items := h.gear.Search(query, "all")
+	maxLvl, _ := h.getHeroShopMaxLevel(context.Background(), c.Sender().ID)
+	if maxLvl <= 0 {
+		return c.Send("🔒 <b>Магазин сейчас закрыт Мастером.</b>", h.mainMenu, tele.ModeHTML)
+	}
+
+	items := h.gear.Search(query, "all", maxLvl)
 	if len(items) == 0 {
 		inline := &tele.ReplyMarkup{}
 		inline.Inline(
 			inline.Row(inline.Data("🔍 Искать снова", "shop_find", "1")),
 			inline.Row(inline.Data("⬅️ В меню магазина", "shop_home", "0")),
 		)
-		return c.Send(fmt.Sprintf("😔 По запросу «<b>%s</b>» ничего не найдено.", html.EscapeString(query)), inline, tele.ModeHTML)
+		return c.Send(fmt.Sprintf("😔 В текущей лавке (до %d ур.) по запросу «<b>%s</b>» ничего не найдено.", maxLvl, html.EscapeString(query)), inline, tele.ModeHTML)
 	}
 
 	const pageSize = 8
@@ -2174,7 +2188,7 @@ func (h *BotHandler) sendShopSearchResults(c tele.Context, query string, page in
 	inline.Inline(rows...)
 
 	return c.Send(
-		fmt.Sprintf("🔍 <b>Результаты поиска по запросу «%s»:</b>", html.EscapeString(query)),
+		fmt.Sprintf("🔍 <b>Результаты поиска по запросу «%s»</b> (лавка до %d ур.):", html.EscapeString(query), maxLvl),
 		inline,
 		tele.ModeHTML,
 	)
@@ -2182,6 +2196,11 @@ func (h *BotHandler) sendShopSearchResults(c tele.Context, query string, page in
 
 func (h *BotHandler) handleShopCategory(c tele.Context) error {
 	_ = c.Respond()
+	maxLvl, _ := h.getHeroShopMaxLevel(context.Background(), c.Sender().ID)
+	if maxLvl <= 0 {
+		return c.Edit("🔒 <b>Магазин сейчас закрыт Мастером.</b>", tele.ModeHTML)
+	}
+
 	kind, pageStr, ok := strings.Cut(c.Callback().Data, "|")
 	if !ok {
 		return c.Edit("❌ Ошибка навигации.")
@@ -2191,9 +2210,11 @@ func (h *BotHandler) handleShopCategory(c tele.Context) error {
 		page = 0
 	}
 
-	items := h.gear.Search("", kind)
+	items := h.gear.Search("", kind, maxLvl)
 	if len(items) == 0 {
-		return c.Edit("⚠️ В этом разделе пока пусто.")
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(inline.Row(inline.Data("⬅️ В меню магазина", "shop_home", "0")))
+		return c.Edit("⚠️ В этом разделе нет товаров, доступных для текущего уровня лавки.", inline)
 	}
 
 	const pageSize = 8
@@ -2238,7 +2259,7 @@ func (h *BotHandler) handleShopCategory(c tele.Context) error {
 		"item":   "🧪 Зелья, свитки и расходники",
 		"armor":  "🧥 Броня и доспехи",
 		"weapon": "⚔️ Оружие",
-		"all":    "📦 Весь каталог",
+		"all":    "📦 Все товары лавки",
 	}
 	title := catTitles[kind]
 	if title == "" {
@@ -2246,7 +2267,7 @@ func (h *BotHandler) handleShopCategory(c tele.Context) error {
 	}
 
 	return c.Edit(
-		fmt.Sprintf("<b>%s</b> (стр. %d из %d)\n<i>Нажмите на товар, чтобы посмотреть описание и купить:</i>", title, page+1, totalPages),
+		fmt.Sprintf("<b>%s</b> (до %d ур. • стр. %d из %d)\n<i>Нажмите на товар, чтобы посмотреть описание и купить:</i>", title, maxLvl, page+1, totalPages),
 		inline,
 		tele.ModeHTML,
 	)
@@ -2341,7 +2362,7 @@ func (h *BotHandler) handleShopBuyExec(c tele.Context) error {
 		priceLabel = "0 ММ"
 	}
 
-	res, err := h.repo.BuyItemFromShop(context.Background(), c.Sender().ID, item.Name, item.Notes, priceLabel, item.PriceCp)
+	res, err := h.repo.BuyItemFromShop(context.Background(), c.Sender().ID, item.Name, item.Notes, priceLabel, item.PriceCp, item.Level)
 	if err != nil {
 		return c.Edit(fmt.Sprintf("❌ Не удалось купить товар: %s", html.EscapeString(err.Error())), tele.ModeHTML)
 	}

@@ -873,25 +873,28 @@ func returnGearToStatsBackpack(stats map[string]any, itemName, itemNotes string)
 	return true
 }
 
-// IsShopOpen проверяет, открыт ли магазин Мастером в текущей комнате кампании
-func (r *HeroRepository) IsShopOpen(ctx context.Context, roomCode string) (bool, error) {
+// GetShopMaxLevel возвращает максимальный уровень товаров в лавке (0 = закрыта)
+func (r *HeroRepository) GetShopMaxLevel(ctx context.Context, roomCode string) (int, error) {
 	var rawJSON []byte
 	err := r.db.QueryRow(ctx, `
 		SELECT map_data FROM public.campaign_state WHERE room_code = $1 LIMIT 1
 	`, roomCode).Scan(&rawJSON)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	var mapData map[string]any
 	if err := json.Unmarshal(rawJSON, &mapData); err != nil {
-		return false, err
+		return 0, err
 	}
 	if bst, ok := mapData["bestiary"].(map[string]any); ok {
-		if open, ok := bst["isShopOpen"].(bool); ok {
-			return open, nil
+		if lvlFloat, ok := bst["shopMaxLevel"].(float64); ok {
+			return int(lvlFloat), nil
+		}
+		if open, ok := bst["isShopOpen"].(bool); ok && open {
+			return 2, nil
 		}
 	}
-	return false, nil
+	return 0, nil
 }
 
 type ShopPurchaseResult struct {
@@ -904,7 +907,7 @@ type ShopPurchaseResult struct {
 }
 
 // BuyItemFromShop списывает монеты (с авторазменом) и кладёт купленный предмет в рюкзак героя
-func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemName, itemNotes, priceText string, priceCp int) (*ShopPurchaseResult, error) {
+func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemName, itemNotes, priceText string, priceCp, itemLevel int) (*ShopPurchaseResult, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -927,9 +930,12 @@ func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemNa
 		return nil, fmt.Errorf("лист персонажа заблокирован Мастером (Read-Only)")
 	}
 
-	isOpen, err := r.IsShopOpen(ctx, roomCode)
-	if err != nil || !isOpen {
+	maxLvl, err := r.GetShopMaxLevel(ctx, roomCode)
+	if err != nil || maxLvl <= 0 {
 		return nil, fmt.Errorf("магазин сейчас закрыт Мастером")
+	}
+	if itemLevel > maxLvl {
+		return nil, fmt.Errorf("этот товар (%d ур.) недоступен в текущей лавке (макс. %d ур.)", itemLevel, maxLvl)
 	}
 
 	var heroData map[string]any
