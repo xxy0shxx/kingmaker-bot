@@ -38,8 +38,8 @@ func NewMapWatcher(repo *repository.HeroRepository, bot *tele.Bot) *MapWatcher {
 }
 
 func (w *MapWatcher) Start(ctx context.Context) {
-	log.Println("🔄 MapWatcher запущен (опрос карты и уведомлений каждые 3 сек)...")
-	ticker := time.NewTicker(3 * time.Second)
+	log.Println("🔄 MapWatcher запущен (опрос карты и уведомлений каждые 5 сек)...")
+	ticker := time.NewTicker(5 * time.Second)
 
 	defer ticker.Stop()
 
