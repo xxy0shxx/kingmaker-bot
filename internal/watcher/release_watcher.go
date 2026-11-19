@@ -328,6 +328,11 @@ func (rw *ReleaseWatcher) PublishRepoNow(ctx context.Context, targetKey string) 
 			return "", fmt.Errorf("не найден заголовок версии")
 		}
 
+		lastVer, _ := rw.repo.GetLastAnnouncedVersion(ctx, src.Key)
+		if lastVer == version {
+			return "", fmt.Errorf("релиз %s (%s) уже был опубликован ранее", version, src.Title)
+		}
+
 		fullTitle := version
 		if headerTitle != "" {
 			fullTitle = fmt.Sprintf("%s — %s", version, headerTitle)
@@ -357,10 +362,17 @@ func (rw *ReleaseWatcher) PublishRepoNow(ctx context.Context, targetKey string) 
 
 		_ = rw.repo.SaveLastAnnouncedVersion(ctx, src.Key, version)
 		log.Printf("🚀 Релиз %s (%s) опубликован вручную (чатов: %d)", src.Key, version, len(sentChats))
-		lastVer, _ := rw.repo.GetLastAnnouncedVersion(ctx, src.Key)
-		if lastVer == version {
-			return "", fmt.Errorf("релиз %s (%s) уже был опубликован ранее", version, src.Title)
+
+		notice := fmt.Sprintf(
+			"📢 Релиз <code>%s</code> (<b>%s</b>) уже опубликован в групповой чат (чатов: <b>%d</b>). Повторная публикация не требуется.",
+			html.EscapeString(version),
+			html.EscapeString(src.Title),
+			len(sentChats),
+		)
+		for _, aID := range getAdminIDs() {
+			_, _ = rw.bot.Send(&tele.User{ID: aID}, notice, tele.ModeHTML)
 		}
+
 		return version, nil
 	}
 
