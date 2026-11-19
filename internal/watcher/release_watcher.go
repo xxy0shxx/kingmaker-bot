@@ -63,12 +63,12 @@ func (rw *ReleaseWatcher) Start(ctx context.Context) {
 	if len(rw.sources) == 0 {
 		return
 	}
-	log.Printf("📦 ReleaseWatcher запущен (отслеживается репозиториев: %d, интервал: 10 мин)...", len(rw.sources))
+	log.Printf("📦 ReleaseWatcher запущен (отслеживается репозиториев: %d, интервал: 1 час)...", len(rw.sources))
 
-	// Проверяем сразу при старте, а затем каждые 10 минут
+	// Проверяем сразу при старте, а затем каждый час
 	rw.checkAll(ctx)
 
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(60 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -357,6 +357,10 @@ func (rw *ReleaseWatcher) PublishRepoNow(ctx context.Context, targetKey string) 
 
 		_ = rw.repo.SaveLastAnnouncedVersion(ctx, src.Key, version)
 		log.Printf("🚀 Релиз %s (%s) опубликован вручную (чатов: %d)", src.Key, version, len(sentChats))
+		lastVer, _ := rw.repo.GetLastAnnouncedVersion(ctx, src.Key)
+		if lastVer == version {
+			return "", fmt.Errorf("релиз %s (%s) уже был опубликован ранее", version, src.Title)
+		}
 		return version, nil
 	}
 
