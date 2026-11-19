@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"html"
 	"kingmaker-bot/internal/watcher"
 	"log"
 	"os"
@@ -79,10 +80,14 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&tele.Btn{Unique: "eq_off"}, h.handleUnequipAction)
 	b.Handle(&tele.Btn{Unique: "eq_on"}, h.handleEquipFromBagAction)
 	b.Handle("/test_release", h.handleTestRelease)
+	b.Handle("/status", h.handleStatus)
 
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
+	b.Handle(&tele.Btn{Unique: "rel_skip"}, h.handleSkipReleaseAction)
+	b.Handle(&tele.Btn{Unique: "rel_toggle"}, h.handleToggleReleaseWatcher)
+	b.Handle(&tele.Btn{Unique: "rel_pub"}, h.handlePublishReleaseAction)
 	b.Handle(&tele.Btn{Unique: "tr_cancel"}, func(c tele.Context) error {
 		_ = c.Respond()
 		h.pendingPays.Delete(c.Sender().ID)
@@ -131,9 +136,8 @@ func (h *BotHandler) handleWebAccess(c tele.Context) error {
 }
 
 func (h *BotHandler) handleBindChat(c tele.Context) error {
-	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
-	if adminID != 0 && c.Sender().ID != adminID {
-		return c.Send("⛔ Только Мастер кампании может привязывать групповые чаты.")
+	if !IsAdmin(c.Sender().ID) {
+		return c.Send("⛔ Эта команда доступна только Мастерам кампании.")
 	}
 
 	if c.Chat().Type == tele.ChatPrivate {
@@ -149,8 +153,21 @@ func (h *BotHandler) handleBindChat(c tele.Context) error {
 		return c.Send(fmt.Sprintf("❌ Не удалось привязать чат: %s", err.Error()))
 	}
 
+	allies, _ := h.repo.GetPartyHeroes(context.Background(), roomCode, "")
+	var heroNames []string
+	for _, a := range allies {
+		name := domain.GetStr(a.Data, "name", "")
+		if name != "" {
+			heroNames = append(heroNames, name)
+		}
+	}
+	partyLine := ""
+	if len(heroNames) > 0 {
+		partyLine = fmt.Sprintf("\n🛡️ *Состав отряда:* %s", strings.Join(heroNames, ", "))
+	}
+
 	return c.Send(
-		fmt.Sprintf("⚔️ *Летописец вступил в строй!*\nЭтот чат успешно привязан к комнате `%s`. Я буду возвещать о каждом походе и открытии отряда!", roomCode),
+		fmt.Sprintf("⚔️ *Летописец вступил в строй!*\nЭтот чат успешно привязан к комнате `%s`. Я буду возвещать о каждом походе, открытии отряда и новых возможностях мира!%s", roomCode, partyLine),
 		tele.ModeMarkdown,
 	)
 }
@@ -615,22 +632,188 @@ func (h *BotHandler) handleEquipFromBagAction(c tele.Context) error {
 	)
 }
 
-func (h *BotHandler) handleTestRelease(c tele.Context) error {
-	adminID, _ := strconv.ParseInt(os.Getenv("ADMIN_TG_ID"), 10, 64)
-	if adminID != 0 && c.Sender().ID != adminID {
-		return c.Send("⛔ Эта команда доступна только Мастеру кампании.")
+func (h *BotHandler) handleSkipReleaseAction(c tele.Context) error {
+	_ = c.Respond()
+	if !IsAdmin(c.Sender().ID) {
+		return nil
 	}
 
+	repoKey, version, ok := strings.Cut(c.Callback().Data, "|")
+	if !ok || repoKey == "" || version == "" {
+		return c.Edit("❌ Ошибка параметров версии.")
+	}
+
+	if err := h.repo.SaveLastAnnouncedVersion(context.Background(), repoKey, version); err != nil {
+		return c.Edit(fmt.Sprintf("❌ Не удалось сохранить статус: %v", err))
+	}
+
+	return c.Edit(
+		fmt.Sprintf("🚫 Публикация релиза <code>%s</code> (<b>%s</b>) в групповой чат отменена.", html.EscapeString(version), html.EscapeString(repoKey)),
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleToggleReleaseWatcher(c tele.Context) error {
+	_ = c.Respond()
+	if !IsAdmin(c.Sender().ID) {
+		return nil
+	}
+
+	pause := c.Callback().Data == "off"
+	if err := h.repo.SetReleaseWatcherPaused(context.Background(), pause); err != nil {
+		return c.Edit(fmt.Sprintf("❌ Ошибка сохранения настройки: %v", err))
+	}
+
+	ctrlMarkup := &tele.ReplyMarkup{}
+	if pause {
+		ctrlMarkup.Inline(ctrlMarkup.Row(ctrlMarkup.Data("▶️ Включить проверку релизов", "rel_toggle", "on")))
+		return c.Edit("⏸ <b>Автопроверка релизов ОТКЛЮЧЕНА.</b>\nНовые версии не будут публиковаться в группу, пока вы не включите её обратно.", ctrlMarkup, tele.ModeHTML)
+	}
+
+	ctrlMarkup.Inline(ctrlMarkup.Row(ctrlMarkup.Data("⏸ Отключить проверку релизов", "rel_toggle", "off")))
+	return c.Edit("▶️ <b>Автопроверка релизов ВКЛЮЧЕНА</b> (проверка каждые 10 мин).", ctrlMarkup, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleTestRelease(c tele.Context) error {
+	if !IsAdmin(c.Sender().ID) {
+		return c.Send("⛔ Эта команда доступна только Мастерам кампании.")
+	}
+
+	ctx := context.Background()
 	rw := watcher.NewReleaseWatcher(h.repo, c.Bot())
-	messages, err := rw.FetchLatestFormatted(context.Background())
-	if err != nil || len(messages) == 0 {
+	previews := rw.FetchLatestPreviews(ctx)
+	if len(previews) == 0 {
 		return c.Send("⚠️ Не заданы ссылки WEB_CHANGELOG_URL / BOT_CHANGELOG_URL в .env")
 	}
 
-	for _, msg := range messages {
-		if err := c.Send(msg, tele.ModeHTML); err != nil {
-			_ = c.Send(fmt.Sprintf("❌ Ошибка отправки HTML: %v", err))
+	for _, p := range previews {
+		if p.RepoKey != "" && p.Version != "" {
+			inline := &tele.ReplyMarkup{}
+			btnPub := inline.Data(
+				fmt.Sprintf("🚀 Опубликовать (%s)", p.Version),
+				"rel_pub",
+				p.RepoKey,
+			)
+			btnSkip := inline.Data(
+				"🚫 Не публиковать",
+				"rel_skip",
+				fmt.Sprintf("%s|%s", p.RepoKey, p.Version),
+			)
+			inline.Inline(inline.Row(btnPub, btnSkip))
+
+			if err := c.Send(p.Html, inline, tele.ModeHTML); err != nil {
+				_ = c.Send(fmt.Sprintf("❌ Ошибка отправки HTML: %v", err))
+			}
+		} else {
+			_ = c.Send(p.Html, tele.ModeHTML)
 		}
 	}
-	return nil
+
+	isPaused := h.repo.IsReleaseWatcherPaused(ctx)
+	ctrlMarkup := &tele.ReplyMarkup{}
+	var statusText string
+	if isPaused {
+		statusText = "⏸ <b>Автопроверка релизов сейчас ОТКЛЮЧЕНА.</b>"
+		ctrlMarkup.Inline(ctrlMarkup.Row(ctrlMarkup.Data("▶️ Включить проверку релизов", "rel_toggle", "on")))
+	} else {
+		statusText = "▶️ <b>Автопроверка релизов сейчас ВКЛЮЧЕНА</b> (каждые 10 мин)."
+		ctrlMarkup.Inline(ctrlMarkup.Row(ctrlMarkup.Data("⏸ Отключить проверку релизов", "rel_toggle", "off")))
+	}
+
+	return c.Send(statusText, ctrlMarkup, tele.ModeHTML)
+}
+
+func (h *BotHandler) handlePublishReleaseAction(c tele.Context) error {
+	_ = c.Respond()
+	if !IsAdmin(c.Sender().ID) {
+		return nil
+	}
+
+	repoKey := strings.TrimSpace(c.Callback().Data)
+	if repoKey == "" {
+		return c.Edit("❌ Не указан репозиторий для публикации.")
+	}
+
+	rw := watcher.NewReleaseWatcher(h.repo, c.Bot())
+	ver, err := rw.PublishRepoNow(context.Background(), repoKey)
+	if err != nil {
+		return c.Edit(fmt.Sprintf("❌ Ошибка публикации: %s", html.EscapeString(err.Error())), tele.ModeHTML)
+	}
+
+	return c.Edit(
+		fmt.Sprintf("✅ Релиз <code>%s</code> (<b>%s</b>) успешно опубликован в групповой чат!", html.EscapeString(ver), html.EscapeString(repoKey)),
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleStatus(c tele.Context) error {
+	if !IsAdmin(c.Sender().ID) {
+		return c.Send("⛔ Эта команда доступна только Мастерам кампании.")
+	}
+
+	ctx := context.Background()
+	st, err := h.repo.GetSystemStatus(ctx)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Ошибка получения статуса БД: %v", err))
+	}
+
+	watcherState := "▶️ Включён (премодерация каждые 10 мин)"
+	if st.IsPaused {
+		watcherState = "⏸ Отключён (на паузе)"
+	}
+
+	webUrlStatus := "✅ настроен"
+	if strings.TrimSpace(os.Getenv("WEB_CHANGELOG_URL")) == "" {
+		webUrlStatus = "⚠️ не задан"
+	}
+	botUrlStatus := "✅ настроен"
+	if strings.TrimSpace(os.Getenv("BOT_CHANGELOG_URL")) == "" {
+		botUrlStatus = "⚠️ не задан"
+	}
+
+	msg := fmt.Sprintf(
+		"📊 <b>Статус системы Kingmaker Bot</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"🌐 <b>Веб-приложение:</b> <code>%s</code> (%s)\n"+
+			"🤖 <b>Telegram-бот:</b> <code>%s</code> (%s)\n"+
+			"🔄 <b>Вотчер релизов:</b> %s\n\n"+
+			"💬 <b>Привязанных групповых чатов:</b> <code>%d</code>\n"+
+			"🛡️ <b>Героев в базе:</b> <code>%d</code> (привязано к TG: <code>%d</code>)\n"+
+			"📬 <b>Очередь уведомлений:</b> <code>%d</code>",
+		html.EscapeString(st.WebVersion), webUrlStatus,
+		html.EscapeString(st.BotVersion), botUrlStatus,
+		watcherState,
+		st.TrackedChats,
+		st.TotalHeroes, st.LinkedHeroes,
+		st.PendingQueue,
+	)
+
+	return c.Send(msg, tele.ModeHTML)
+}
+
+func GetAdminIDs() []int64 {
+	raw := strings.TrimSpace(os.Getenv("ADMIN_TG_ID"))
+	if raw == "" {
+		return nil
+	}
+	var ids []int64
+	for _, part := range strings.Split(raw, ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id != 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func IsAdmin(userID int64) bool {
+	admins := GetAdminIDs()
+	if len(admins) == 0 {
+		return true
+	}
+	for _, id := range admins {
+		if id == userID {
+			return true
+		}
+	}
+	return false
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,12 +63,12 @@ func (rw *ReleaseWatcher) Start(ctx context.Context) {
 	if len(rw.sources) == 0 {
 		return
 	}
-	log.Printf("📦 ReleaseWatcher запущен (отслеживается репозиториев: %d)...", len(rw.sources))
+	log.Printf("📦 ReleaseWatcher запущен (отслеживается репозиториев: %d, интервал: 10 мин)...", len(rw.sources))
 
-	// Проверяем сразу при старте, а затем каждые 2 минуты
+	// Проверяем сразу при старте, а затем каждые 10 минут
 	rw.checkAll(ctx)
 
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -81,6 +82,10 @@ func (rw *ReleaseWatcher) Start(ctx context.Context) {
 }
 
 func (rw *ReleaseWatcher) checkAll(ctx context.Context) {
+	if rw.repo.IsReleaseWatcherPaused(ctx) {
+		return
+	}
+
 	for _, src := range rw.sources {
 		md, err := rw.fetchMarkdown(ctx, src.URL)
 		if err != nil {
@@ -90,17 +95,14 @@ func (rw *ReleaseWatcher) checkAll(ctx context.Context) {
 
 		version, headerTitle, bodyLines := parseLatestRelease(md)
 		if version == "" {
-			log.Printf("⚠️ В файле %s не найден заголовок версии", src.Key)
 			continue
 		}
 
 		lastVer, err := rw.repo.GetLastAnnouncedVersion(ctx, src.Key)
 		if err != nil {
-			log.Printf("Ошибка чтения bot_release_state (%s): %v", src.Key, err)
 			continue
 		}
 
-		// При самом первом запуске запоминаем текущую версию без спама старым релизом
 		if lastVer == "" {
 			_ = rw.repo.SaveLastAnnouncedVersion(ctx, src.Key, version)
 			log.Printf("📌 Зафиксирована стартовая версия %s: %s", src.Key, version)
@@ -111,43 +113,59 @@ func (rw *ReleaseWatcher) checkAll(ctx context.Context) {
 			continue
 		}
 
+		// Проверяем, не отправляли ли мы уже эту версию Мастеру на премодерацию
+		pendingVer, _ := rw.repo.GetPendingModerationVersion(ctx, src.Key)
+		if pendingVer == version {
+			continue
+		}
+
 		fullTitle := version
 		if headerTitle != "" {
 			fullTitle = fmt.Sprintf("%s — %s", version, headerTitle)
 		}
 		msg := formatReleaseHtml(src, fullTitle, bodyLines)
 
-		campaigns, err := rw.repo.GetTrackedCampaigns(ctx)
-		if err != nil {
-			log.Printf("Ошибка получения чатов (%s): %v", src.Key, err)
-			continue
-		}
-		if len(campaigns) == 0 {
-			log.Printf("⚠️ Релиз %s (%s) готов, но в campaign_state нет привязанных чатов (telegram_chat_id)", src.Key, version)
+		// Режим премодерации: отправляем сначала Мастеру в личку с кнопками
+		adminIDs := getAdminIDs()
+		if len(adminIDs) > 0 {
+			modNotice := fmt.Sprintf("🔔 <b>Обнаружен новый релиз для публикации!</b>\n\n%s", msg)
+			inline := &tele.ReplyMarkup{}
+			btnPub := inline.Data(
+				fmt.Sprintf("🚀 Опубликовать (%s)", version),
+				"rel_pub",
+				src.Key,
+			)
+			btnSkip := inline.Data(
+				"🚫 Не публиковать",
+				"rel_skip",
+				fmt.Sprintf("%s|%s", src.Key, version),
+			)
+			inline.Inline(inline.Row(btnPub, btnSkip))
+
+			sentToAny := false
+			for _, aID := range adminIDs {
+				if _, err := rw.bot.Send(&tele.User{ID: aID}, modNotice, inline, tele.ModeHTML); err != nil {
+					log.Printf("Ошибка отправки релиза на премодерацию админу %d: %v", aID, err)
+				} else {
+					sentToAny = true
+				}
+			}
+
+			if sentToAny {
+				_ = rw.repo.SavePendingModerationVersion(ctx, src.Key, version)
+				log.Printf("🛡️ Релиз %s (%s) отправлен админам на премодерацию", src.Key, version)
+			}
 			continue
 		}
 
-		sentChats := make(map[int64]bool)
-		for _, camp := range campaigns {
-			if camp.TelegramChatID == 0 || sentChats[camp.TelegramChatID] {
-				continue
-			}
-			if _, err := rw.bot.Send(&tele.Chat{ID: camp.TelegramChatID}, msg, tele.ModeHTML); err != nil {
-				log.Printf("Ошибка отправки релиза в чат %d: %v", camp.TelegramChatID, err)
-			} else {
-				sentChats[camp.TelegramChatID] = true
-			}
-		}
-
-		if len(sentChats) > 0 {
-			_ = rw.repo.SaveLastAnnouncedVersion(ctx, src.Key, version)
-			log.Printf("🚀 Опубликован новый релиз %s: %s (чатов: %d)", src.Key, version, len(sentChats))
+		// Запасной вариант, если ADMIN_TG_ID не указан — публикуем сразу в группу
+		if _, err := rw.PublishRepoNow(ctx, src.Key); err != nil {
+			log.Printf("Ошибка автопубликации %s: %v", src.Key, err)
 		}
 	}
 }
 
 func (rw *ReleaseWatcher) fetchMarkdown(ctx context.Context, rawURL string) (string, error) {
-	// Добавляем timestamp-параметр, чтобы обходить кэш CDN GitHub (://githubusercontent.com кэширует на 5 мин)
 	sep := "?"
 	if strings.Contains(rawURL, "?") {
 		sep = "&"
@@ -256,4 +274,105 @@ func (rw *ReleaseWatcher) FetchLatestFormatted(ctx context.Context) ([]string, e
 		messages = append(messages, formatReleaseHtml(src, fullTitle, bodyLines))
 	}
 	return messages, nil
+}
+
+type ReleasePreview struct {
+	RepoKey string
+	Version string
+	Html    string
+}
+
+func (rw *ReleaseWatcher) FetchLatestPreviews(ctx context.Context) []ReleasePreview {
+	var list []ReleasePreview
+	for _, src := range rw.sources {
+		md, err := rw.fetchMarkdown(ctx, src.URL)
+		if err != nil {
+			list = append(list, ReleasePreview{
+				Html: fmt.Sprintf("⚠️ Не удалось загрузить <b>%s</b>: %s", html.EscapeString(src.Title), html.EscapeString(err.Error())),
+			})
+			continue
+		}
+		version, headerTitle, bodyLines := parseLatestRelease(md)
+		if version == "" {
+			list = append(list, ReleasePreview{
+				Html: fmt.Sprintf("⚠️ В файле <b>%s</b> не найден заголовок версии.", html.EscapeString(src.Title)),
+			})
+			continue
+		}
+		fullTitle := version
+		if headerTitle != "" {
+			fullTitle = fmt.Sprintf("%s — %s", version, headerTitle)
+		}
+		list = append(list, ReleasePreview{
+			RepoKey: src.Key,
+			Version: version,
+			Html:    formatReleaseHtml(src, fullTitle, bodyLines),
+		})
+	}
+	return list
+}
+
+func (rw *ReleaseWatcher) PublishRepoNow(ctx context.Context, targetKey string) (string, error) {
+	for _, src := range rw.sources {
+		if src.Key != targetKey {
+			continue
+		}
+
+		md, err := rw.fetchMarkdown(ctx, src.URL)
+		if err != nil {
+			return "", fmt.Errorf("не удалось загрузить CHANGELOG: %w", err)
+		}
+
+		version, headerTitle, bodyLines := parseLatestRelease(md)
+		if version == "" {
+			return "", fmt.Errorf("не найден заголовок версии")
+		}
+
+		fullTitle := version
+		if headerTitle != "" {
+			fullTitle = fmt.Sprintf("%s — %s", version, headerTitle)
+		}
+		msg := formatReleaseHtml(src, fullTitle, bodyLines)
+
+		campaigns, err := rw.repo.GetTrackedCampaigns(ctx)
+		if err != nil {
+			return "", err
+		}
+
+		sentChats := make(map[int64]bool)
+		for _, camp := range campaigns {
+			if camp.TelegramChatID == 0 || sentChats[camp.TelegramChatID] {
+				continue
+			}
+			if _, err := rw.bot.Send(&tele.Chat{ID: camp.TelegramChatID}, msg, tele.ModeHTML); err != nil {
+				log.Printf("Ошибка ручной отправки релиза в чат %d: %v", camp.TelegramChatID, err)
+			} else {
+				sentChats[camp.TelegramChatID] = true
+			}
+		}
+
+		if len(sentChats) == 0 {
+			return "", fmt.Errorf("нет привязанных групповых чатов или не удалось отправить сообщение")
+		}
+
+		_ = rw.repo.SaveLastAnnouncedVersion(ctx, src.Key, version)
+		log.Printf("🚀 Релиз %s (%s) опубликован вручную (чатов: %d)", src.Key, version, len(sentChats))
+		return version, nil
+	}
+
+	return "", fmt.Errorf("источник %q не настроен", targetKey)
+}
+
+func getAdminIDs() []int64 {
+	raw := strings.TrimSpace(os.Getenv("ADMIN_TG_ID"))
+	if raw == "" {
+		return nil
+	}
+	var ids []int64
+	for _, part := range strings.Split(raw, ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id != 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }

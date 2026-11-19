@@ -848,3 +848,89 @@ func (r *HeroRepository) SaveLastAnnouncedVersion(ctx context.Context, repoKey, 
 	`, repoKey, version)
 	return err
 }
+
+func (r *HeroRepository) IsReleaseWatcherPaused(ctx context.Context) bool {
+	var val string
+	err := r.db.QueryRow(ctx, `
+		SELECT last_version FROM public.bot_release_state WHERE repo_key = '_watcher_paused'
+	`).Scan(&val)
+	return err == nil && val == "true"
+}
+
+func (r *HeroRepository) SetReleaseWatcherPaused(ctx context.Context, paused bool) error {
+	val := "false"
+	if paused {
+		val = "true"
+	}
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO public.bot_release_state (repo_key, last_version, updated_at)
+		VALUES ('_watcher_paused', $1, NOW())
+		ON CONFLICT (repo_key)
+		DO UPDATE SET last_version = EXCLUDED.last_version, updated_at = NOW()
+	`, val)
+	return err
+}
+
+func (r *HeroRepository) GetPendingModerationVersion(ctx context.Context, repoKey string) (string, error) {
+	var ver string
+	err := r.db.QueryRow(ctx, `
+		SELECT last_version FROM public.bot_release_state WHERE repo_key = $1
+	`, "pending_"+repoKey).Scan(&ver)
+	if err != nil {
+		return "", nil
+	}
+	return ver, nil
+}
+
+func (r *HeroRepository) SavePendingModerationVersion(ctx context.Context, repoKey, version string) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO public.bot_release_state (repo_key, last_version, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (repo_key)
+		DO UPDATE SET last_version = EXCLUDED.last_version, updated_at = NOW()
+	`, "pending_"+repoKey, version)
+	return err
+}
+
+type BotSystemStatus struct {
+	WebVersion   string
+	BotVersion   string
+	IsPaused     bool
+	TrackedChats int
+	LinkedHeroes int
+	TotalHeroes  int
+	PendingQueue int
+}
+
+func (r *HeroRepository) GetSystemStatus(ctx context.Context) (*BotSystemStatus, error) {
+	st := &BotSystemStatus{
+		WebVersion: "не зафиксирована",
+		BotVersion: "не зафиксирована",
+		IsPaused:   r.IsReleaseWatcherPaused(ctx),
+	}
+
+	if v, _ := r.GetLastAnnouncedVersion(ctx, "web_app"); v != "" {
+		st.WebVersion = v
+	}
+	if v, _ := r.GetLastAnnouncedVersion(ctx, "tg_bot"); v != "" {
+		st.BotVersion = v
+	}
+
+	_ = r.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM public.campaign_state
+		WHERE telegram_chat_id IS NOT NULL AND telegram_chat_id <> 0
+	`).Scan(&st.TrackedChats)
+
+	_ = r.db.QueryRow(ctx, `
+		SELECT 
+			COUNT(*),
+			COUNT(*) FILTER (WHERE telegram_user_id IS NOT NULL AND telegram_user_id <> 0)
+		FROM public.campaign_heroes
+	`).Scan(&st.TotalHeroes, &st.LinkedHeroes)
+
+	_ = r.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM public.tg_notifications
+	`).Scan(&st.PendingQueue)
+
+	return st, nil
+}
