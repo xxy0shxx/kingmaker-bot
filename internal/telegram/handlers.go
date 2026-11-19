@@ -90,8 +90,10 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&h.btnEquip, h.handleEquipMenu)
 	b.Handle(&tele.Btn{Unique: "eq_off"}, h.handleUnequipAction)
 	b.Handle(&tele.Btn{Unique: "eq_on"}, h.handleEquipFromBagAction)
+
 	b.Handle("/test_release", h.handleTestRelease)
 	b.Handle("/status", h.handleStatus)
+
 	b.Handle("/shop", h.handleShopMenu)
 	b.Handle(&h.btnShop, h.handleShopMenu)
 	b.Handle(&tele.Btn{Unique: "shop_home"}, h.handleShopHomeCallback)
@@ -99,6 +101,10 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&tele.Btn{Unique: "shop_find"}, h.handleShopSearchPrompt)
 	b.Handle(&tele.Btn{Unique: "shop_item"}, h.handleShopItemView)
 	b.Handle(&tele.Btn{Unique: "shop_buy"}, h.handleShopBuyExec)
+
+	b.Handle("/rule", h.handleRuleCommand)
+	b.Handle(&tele.Btn{Unique: "rule_cat"}, h.handleRuleCategoryCallback)
+	b.Handle(&tele.Btn{Unique: "rule_view"}, h.handleRuleViewCallback)
 
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
@@ -501,6 +507,23 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 	}
 
 	if isBotMentioned(text, c.Bot().Me) {
+		if ruleQuery, isRuleReq := extractBerestaRuleQuery(text); isRuleReq {
+			matches := catalog.SearchRules(ruleQuery, "all")
+			if len(matches) == 1 {
+				r := matches[0]
+				return c.Reply(fmt.Sprintf("📖 <b>%s</b>\n━━━━━━━━━━━━━━━━━━━━\n%s", r.Title, r.Summary), tele.ModeHTML)
+			}
+			if len(matches) > 1 {
+				inline := &tele.ReplyMarkup{}
+				var rows []tele.Row
+				for _, r := range matches {
+					rows = append(rows, inline.Row(inline.Data(r.Title, "rule_view", r.ID)))
+				}
+				inline.Inline(rows...)
+				return c.Reply(fmt.Sprintf("📖 <b>Нашёл несколько правил по запросу «%s»:</b>", html.EscapeString(ruleQuery)), inline, tele.ModeHTML)
+			}
+		}
+
 		chatID := c.Chat().ID
 		if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
 			if time.Since(lastVal.(time.Time)) < 15*time.Second {
@@ -526,6 +549,21 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 	}
 
 	return nil
+}
+
+var berestaRuleTriggerRegex = regexp.MustCompile(`(?i)(?:правил[аоуеы]?|состояни[еяю]|что такое|как работает|механик[ауе])\s+(.+)$`)
+
+func extractBerestaRuleQuery(text string) (string, bool) {
+	clean := strings.TrimSpace(strings.TrimRight(text, "?!."))
+	m := berestaRuleTriggerRegex.FindStringSubmatch(clean)
+	if len(m) < 2 {
+		return "", false
+	}
+	q := strings.TrimSpace(m[1])
+	if len([]rune(q)) < 3 {
+		return "", false
+	}
+	return q, true
 }
 
 func isBotMentioned(text string, me *tele.User) bool {
@@ -2388,6 +2426,176 @@ func (h *BotHandler) handleShopBuyExec(c tele.Context) error {
 			html.EscapeString(res.PriceText),
 			res.RemGold, res.RemSilver, res.RemCopper,
 		),
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func buildRuleCategoriesMarkup() *tele.ReplyMarkup {
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(
+		inline.Row(inline.Data("🎭 Состояния (Испуг, Врасплох, Ниц...)", "rule_cat", "condition|0")),
+		inline.Row(inline.Data("⚔️ Боевые манёвры и действия", "rule_cat", "action|0")),
+		inline.Row(inline.Data("💀 Смерть, Лечение и Отдых", "rule_cat", "death|0")),
+		inline.Row(inline.Data("🥷 Укрытия, Скрытность и Разведка", "rule_cat", "stealth|0")),
+	)
+	return inline
+}
+
+// --- Справочник правил и состояний PF2e ---
+
+func (h *BotHandler) handleRuleCommand(c tele.Context) error {
+	query := strings.TrimSpace(c.Message().Payload)
+	if query == "" {
+		return c.Send(
+			"📖 <b>Быстрый справочник правил PF2e</b>\n"+
+				"━━━━━━━━━━━━━━━━━━━━\n"+
+				"Выберите раздел ниже или введите запрос сразу командой:\n"+
+				"<code>/rule врасплох</code> • <code>/rule захват</code> • <code>/rule при смерти</code>",
+			buildRuleCategoriesMarkup(),
+			tele.ModeHTML,
+		)
+	}
+
+	matches := catalog.SearchRules(query, "all")
+	if len(matches) == 0 {
+		return c.Send(
+			fmt.Sprintf("🔍 По запросу «<b>%s</b>» ничего не найдено.\nНапишите <code>/rule</code>, чтобы открыть список разделов.", html.EscapeString(query)),
+			tele.ModeHTML,
+		)
+	}
+
+	if len(matches) == 1 {
+		r := matches[0]
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(inline.Row(inline.Data("📖 Все разделы правил", "rule_cat", "home|0")))
+		return c.Send(
+			fmt.Sprintf("<b>%s</b>\n━━━━━━━━━━━━━━━━━━━━\n%s", r.Title, r.Summary),
+			inline,
+			tele.ModeHTML,
+		)
+	}
+
+	const maxShown = 6
+	if len(matches) > maxShown {
+		matches = matches[:maxShown]
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, r := range matches {
+		rows = append(rows, inline.Row(inline.Data(r.Title, "rule_view", r.ID+"|0")))
+	}
+	rows = append(rows, inline.Row(inline.Data("📖 Все разделы правил", "rule_cat", "home|0")))
+	inline.Inline(rows...)
+
+	return c.Send(
+		fmt.Sprintf("📖 <b>Найдено несколько правил по запросу «%s»:</b>", html.EscapeString(query)),
+		inline,
+		tele.ModeHTML,
+	)
+}
+func (h *BotHandler) handleRuleCategoryCallback(c tele.Context) error {
+	_ = c.Respond()
+	raw := c.Callback().Data
+	cat, pageStr, hasPage := strings.Cut(raw, "|")
+	if !hasPage {
+		cat = raw
+		pageStr = "0"
+	}
+
+	if cat == "home" {
+		return c.Edit(
+			"📖 <b>Быстрый справочник правил PF2e</b>\n━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:",
+			buildRuleCategoriesMarkup(),
+			tele.ModeHTML,
+		)
+	}
+
+	page, _ := strconv.Atoi(pageStr)
+	if page < 0 {
+		page = 0
+	}
+
+	entries := catalog.SearchRules("", cat)
+	if len(entries) == 0 {
+		return c.Edit("⚠️ В этом разделе пока нет записей.", buildRuleCategoriesMarkup())
+	}
+
+	const pageSize = 6
+	totalPages := (len(entries) + pageSize - 1) / pageSize
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+
+	start := page * pageSize
+	end := start + pageSize
+	if end > len(entries) {
+		end = len(entries)
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, r := range entries[start:end] {
+		rows = append(rows, inline.Row(inline.Data(r.Title, "rule_view", fmt.Sprintf("%s|%d", r.ID, page))))
+	}
+
+	var navBtns []tele.Btn
+	if page > 0 {
+		navBtns = append(navBtns, inline.Data("⬅️ Назад", "rule_cat", fmt.Sprintf("%s|%d", cat, page-1)))
+	}
+	if page+1 < totalPages {
+		navBtns = append(navBtns, inline.Data("Вперёд ➡️", "rule_cat", fmt.Sprintf("%s|%d", cat, page+1)))
+	}
+	if len(navBtns) > 0 {
+		rows = append(rows, inline.Row(navBtns...))
+	}
+
+	rows = append(rows, inline.Row(inline.Data("📖 К разделам", "rule_cat", "home|0")))
+	inline.Inline(rows...)
+
+	catTitles := map[string]string{
+		"condition": "🎭 Состояния",
+		"action":    "⚔️ Боевые манёвры и действия",
+		"death":     "💀 Смерть, Лечение и Отдых",
+		"stealth":   "🥷 Укрытия, Скрытность и Разведка",
+	}
+	title := catTitles[cat]
+	if title == "" {
+		title = "📖 Справочник"
+	}
+
+	return c.Edit(
+		fmt.Sprintf("<b>%s</b> (стр. %d из %d)\n<i>Выберите правило для просмотра:</i>", title, page+1, totalPages),
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleRuleViewCallback(c tele.Context) error {
+	_ = c.Respond()
+	raw := c.Callback().Data
+	ruleID, backPageStr, hasPage := strings.Cut(raw, "|")
+	if !hasPage {
+		ruleID = raw
+		backPageStr = "0"
+	}
+
+	r := catalog.FindRuleByID(ruleID)
+	if r == nil {
+		return c.Edit("⚠️ Запись не найдена.")
+	}
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(
+		inline.Row(
+			inline.Data("⬅️ Назад в раздел", "rule_cat", fmt.Sprintf("%s|%s", r.Category, backPageStr)),
+			inline.Data("📖 Все разделы", "rule_cat", "home|0"),
+		),
+	)
+
+	return c.Edit(
+		fmt.Sprintf("<b>%s</b>\n━━━━━━━━━━━━━━━━━━━━\n%s", r.Title, r.Summary),
 		inline,
 		tele.ModeHTML,
 	)
