@@ -118,6 +118,10 @@ func (h *BotHandler) Register(b *tele.Bot) {
 }
 
 func (h *BotHandler) handleWebAccess(c tele.Context) error {
+	if c.Chat().Type != tele.ChatPrivate {
+		return c.Send("🔒 Персональная ссылка на лист персонажа доступна только в личных сообщениях с ботом.")
+	}
+
 	h.pendingPays.Delete(c.Sender().ID)
 	hero, err := h.repo.GetHeroByTgID(context.Background(), c.Sender().ID)
 	if err != nil {

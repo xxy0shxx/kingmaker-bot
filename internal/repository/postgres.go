@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+
 	"kingmaker-bot/internal/domain"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -242,6 +244,10 @@ func (r *HeroRepository) TransferItem(ctx context.Context, senderTgID int64, slo
 		return nil, err
 	}
 
+	senderName := domain.GetStr(senderData, "name", "Герой")
+	recName := domain.GetStr(recData, "name", "Союзник")
+	appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🎁 [TG] %s → %s: %s (×%d)", senderName, recName, itemName, moveQty))
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -369,6 +375,10 @@ func (r *HeroRepository) TransferCoins(ctx context.Context, senderTgID int64, re
 	`, string(newRecBytes), recipientID); err != nil {
 		return nil, err
 	}
+
+	senderName := domain.GetStr(senderData, "name", "Герой")
+	recName := domain.GetStr(recData, "name", "Союзник")
+	appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("💸 [TG] %s → %s: %d ЗМ %d СМ %d ММ", senderName, recName, gold, silver, copper))
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -977,6 +987,9 @@ func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemNa
 		return nil, err
 	}
 
+	heroName := domain.GetStr(heroData, "name", "Герой")
+	appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🛒 [TG] %s купил: %s (−%s)", heroName, itemName, priceText))
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -989,4 +1002,37 @@ func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemNa
 		RemSilver: remS,
 		RemCopper: remC,
 	}, nil
+}
+
+func appendRoomAuditLog(ctx context.Context, tx pgx.Tx, roomCode, text string) {
+	if roomCode == "" || text == "" {
+		return
+	}
+	var rawJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT map_data FROM public.campaign_state WHERE room_code = $1 FOR UPDATE`, roomCode).Scan(&rawJSON); err != nil {
+		return
+	}
+	var mapData map[string]any
+	if json.Unmarshal(rawJSON, &mapData) != nil {
+		return
+	}
+	bst, ok := mapData["bestiary"].(map[string]any)
+	if !ok {
+		return
+	}
+	tr, ok := bst["treasury"].(map[string]any)
+	if !ok {
+		tr = map[string]any{"gold": 0, "silver": 0, "copper": 0, "notes": "", "log": []any{}}
+		bst["treasury"] = tr
+	}
+	oldLog, _ := tr["log"].([]any)
+	newLog := append([]any{text}, oldLog...)
+	if len(newLog) > 30 {
+		newLog = newLog[:30]
+	}
+	tr["log"] = newLog
+
+	if updated, err := json.Marshal(mapData); err == nil {
+		_, _ = tx.Exec(ctx, `UPDATE public.campaign_state SET map_data = $1::jsonb WHERE room_code = $2`, string(updated), roomCode)
+	}
 }
