@@ -118,6 +118,9 @@ func (h *BotHandler) Register(b *tele.Bot) {
 
 	b.Handle("/session", h.handleSessionCommand)
 
+	b.Handle("/item", h.handleItemCommand)
+	b.Handle(&tele.Btn{Unique: "item_view"}, h.handleItemViewCallback)
+
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
@@ -557,6 +560,25 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 					}
 					inline.Inline(rows...)
 					return c.Reply(fmt.Sprintf("📖 <b>Нашёл несколько правил по запросу «%s»:</b>", html.EscapeString(ruleQuery)), inline, tele.ModeHTML)
+				}
+			}
+
+			if itemQuery, isItemReq := extractBerestaItemQuery(text); isItemReq && h.gear != nil {
+				matches := h.gear.SearchAll(itemQuery)
+				if len(matches) == 1 {
+					return c.Reply(formatGearCardHTML(matches[0]), tele.ModeHTML)
+				}
+				if len(matches) > 1 {
+					if len(matches) > 8 {
+						matches = matches[:8]
+					}
+					inline := &tele.ReplyMarkup{}
+					var rows []tele.Row
+					for _, it := range matches {
+						rows = append(rows, inline.Row(inline.Data(fmt.Sprintf("%s (%d ур.)", it.Name, it.Level), "item_view", it.ID)))
+					}
+					inline.Inline(rows...)
+					return c.Reply(fmt.Sprintf("🗡️ <b>Нашёл несколько предметов по запросу «%s»:</b>", html.EscapeString(itemQuery)), inline, tele.ModeHTML)
 				}
 			}
 
@@ -4046,4 +4068,149 @@ func buildUnmuteReply() string {
 		"🐈‍⬛ *Мяу! Я вернулся!* Давайте уже решим, куда дальше пойдёт наш славный отряд!",
 	}
 	return replies[rand.Intn(len(replies))]
+}
+
+var berestaItemTriggerRegex = regexp.MustCompile(`(?i)(?:предмет|оружи[еяю]|брон[яюе]|доспех[иа]?|щит|вещ[ьи]|покажи|найди|статы|характеристик[иа]|описани[ея]|что за|расскажи про|подскажи про|про)\s+(.+)$`)
+
+func extractBerestaItemQuery(text string) (string, bool) {
+	clean := strings.TrimSpace(strings.TrimRight(text, "?!."))
+	m := berestaItemTriggerRegex.FindStringSubmatch(clean)
+	if len(m) < 2 {
+		return "", false
+	}
+	q := strings.TrimSpace(m[1])
+	if len([]rune(q)) < 3 {
+		return "", false
+	}
+	return q, true
+}
+
+func formatGearCardHTML(it catalog.GearItem) string {
+	var sb strings.Builder
+
+	icon := "📦"
+	switch it.Kind {
+	case "melee":
+		icon = "⚔️"
+	case "ranged":
+		icon = "🏹"
+	case "armor":
+		icon = "🧥"
+	case "item":
+		icon = "🧪"
+	}
+	if it.ShieldBonus > 0 {
+		icon = "🛡️"
+	}
+
+	priceLabel := it.Price
+	if priceLabel == "" {
+		priceLabel = "0 ММ"
+	}
+
+	sb.WriteString(fmt.Sprintf("%s <b>%s</b> (Ур. %d)\n", icon, html.EscapeString(it.Name), it.Level))
+	sb.WriteString(fmt.Sprintf("📂 <i>%s</i> • 💵 <code>%s</code>\n", html.EscapeString(it.Category), html.EscapeString(priceLabel)))
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+
+	// Параметры оружия
+	if it.DmgDice != "" || it.Range != "" || it.Hands > 0 {
+		var wStats []string
+		if it.DmgDice != "" {
+			dmgStr := it.DmgDice
+			if it.DmgType != "" {
+				dmgStr += " " + it.DmgType
+			}
+			wStats = append(wStats, fmt.Sprintf("💥 <b>Урон:</b> <code>%s</code>", html.EscapeString(dmgStr)))
+		}
+		if it.Hands > 0 {
+			wStats = append(wStats, fmt.Sprintf("🖐️ <b>Хват:</b> <code>%d рук.</code>", it.Hands))
+		}
+		if it.Range != "" {
+			wStats = append(wStats, fmt.Sprintf("🎯 <b>Дистанция:</b> <code>%s</code>", html.EscapeString(it.Range)))
+		}
+		sb.WriteString(strings.Join(wStats, " • ") + "\n")
+	}
+
+	// Параметры брони
+	if it.Kind == "armor" || it.ACBonus > 0 {
+		var aStats []string
+		aStats = append(aStats, fmt.Sprintf("🛡️ <b>Бонус КБ:</b> <code>+%d</code>", it.ACBonus))
+		aStats = append(aStats, fmt.Sprintf("🤸 <b>Макс. ЛВК:</b> <code>+%d</code>", it.DexCap))
+		if it.Penalty != 0 {
+			aStats = append(aStats, fmt.Sprintf("⚠️ <b>Штраф проверок:</b> <code>%d</code>", it.Penalty))
+		}
+		if it.StrReq > 0 {
+			aStats = append(aStats, fmt.Sprintf("💪 <b>Сила:</b> <code>+%d</code>", it.StrReq))
+		}
+		sb.WriteString(strings.Join(aStats, " • ") + "\n")
+	}
+
+	// Параметры щита
+	if it.ShieldBonus > 0 {
+		sb.WriteString(fmt.Sprintf("🛡️ <b>Бонус щита:</b> <code>+%d КБ</code> • 🧱 <b>Твёрдость:</b> <code>%d</code> • ❤️ <b>ПЗ:</b> <code>%d</code>\n",
+			it.ShieldBonus, it.ShieldHardness, it.ShieldHp))
+	}
+
+	if strings.TrimSpace(it.Traits) != "" {
+		sb.WriteString(fmt.Sprintf("🏷️ <b>Признаки:</b> <i>%s</i>\n", html.EscapeString(it.Traits)))
+	}
+
+	if strings.TrimSpace(it.Notes) != "" {
+		sb.WriteString(fmt.Sprintf("\n📖 %s", html.EscapeString(it.Notes)))
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func (h *BotHandler) handleItemCommand(c tele.Context) error {
+	if h.gear == nil || h.gear.Count() == 0 {
+		return c.Send("⚠️ Справочник предметов временно недоступен.")
+	}
+
+	query := strings.TrimSpace(c.Message().Payload)
+	if query == "" {
+		return c.Send(
+			"🗡️ <b>Справочник снаряжения, оружия и предметов</b>\n"+
+				"━━━━━━━━━━━━━━━━━━━━\n"+
+				"Укажите название после команды или спросите у Бересты в чате:\n"+
+				"<code>/item длинный меч</code> • <code>/item латы</code> • <code>/item лечебное зелье</code>",
+			tele.ModeHTML,
+		)
+	}
+
+	matches := h.gear.SearchAll(query)
+	if len(matches) == 0 {
+		return c.Send(fmt.Sprintf("🔍 В каталоге по запросу «<b>%s</b>» ничего не найдено.", html.EscapeString(query)), tele.ModeHTML)
+	}
+
+	if len(matches) == 1 {
+		return c.Send(formatGearCardHTML(matches[0]), tele.ModeHTML)
+	}
+
+	if len(matches) > 8 {
+		matches = matches[:8]
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, it := range matches {
+		rows = append(rows, inline.Row(inline.Data(fmt.Sprintf("%s (%d ур.)", it.Name, it.Level), "item_view", it.ID)))
+	}
+	inline.Inline(rows...)
+
+	return c.Send(
+		fmt.Sprintf("🗡️ <b>Найдено несколько предметов по запросу «%s»:</b>", html.EscapeString(query)),
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleItemViewCallback(c tele.Context) error {
+	_ = c.Respond()
+	itemID := strings.TrimSpace(c.Callback().Data)
+	item := h.findGearByID(itemID)
+	if item == nil {
+		return c.Edit("⚠️ Предмет не найден в каталоге.")
+	}
+	return c.Edit(formatGearCardHTML(*item), tele.ModeHTML)
 }

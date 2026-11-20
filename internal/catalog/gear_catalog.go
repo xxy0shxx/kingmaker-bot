@@ -210,3 +210,28 @@ func isHiddenInShop(it GearItem, maxLevel int) bool {
 	}
 	return false
 }
+
+// SearchAll ищет предметы по названию во всём справочнике (без ограничений уровня лавки)
+func (s *GearStore) SearchAll(query string) []GearItem {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	q := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(query), "ё", "е"))
+	if q == "" {
+		return nil
+	}
+
+	var exact []GearItem
+	var partial []GearItem
+
+	for _, it := range s.items {
+		nameNorm := strings.ToLower(strings.ReplaceAll(it.Name, "ё", "е"))
+		if nameNorm == q {
+			exact = append(exact, it)
+		} else if strings.Contains(nameNorm, q) {
+			partial = append(partial, it)
+		}
+	}
+
+	return append(exact, partial...)
+}
