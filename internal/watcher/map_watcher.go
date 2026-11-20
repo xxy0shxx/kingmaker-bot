@@ -229,6 +229,41 @@ func (w *MapWatcher) checkRooms(ctx context.Context) {
 				}
 			}
 		}
+		// 5. Напоминания о следующей игровой сессии (за 24 ч и за 2 ч)
+		if ns, ok := camp.MapData["nextSession"].(map[string]any); ok && ns != nil {
+			isoStr, _ := ns["dateTimeISO"].(string)
+			noteStr, _ := ns["note"].(string)
+			rem24, _ := ns["reminded24h"].(bool)
+			rem2, _ := ns["reminded2h"].(bool)
+
+			if targetTime, err := time.Parse(time.RFC3339, isoStr); err == nil {
+				until := time.Until(targetTime)
+				loc := time.FixedZone("NSK", 7*3600)
+				localTimeStr := targetTime.In(loc).Format("02.01.2006 в 15:04")
+
+				if until > 0 && until <= 24*time.Hour && !rem24 {
+					_ = w.repo.MarkSessionReminderSent(ctx, camp.RoomCode, "reminded24h")
+					msg := fmt.Sprintf(
+						"📣 *Напоминание от летописца Бересты!*\nЗавтра (*%s*) состоится следующая игровая сессия!\n🎒 Проверьте сухпайки (`/rations`), зелья и подготовленные заклинания.",
+						localTimeStr,
+					)
+					if noteStr != "" {
+						msg += fmt.Sprintf("\n📝 *Заметка Мастера:* %s", noteStr)
+					}
+					_, _ = w.bot.Send(&tele.Chat{ID: camp.TelegramChatID}, msg, tele.ModeMarkdown)
+				} else if until > 0 && until <= 2*time.Hour && !rem2 {
+					_ = w.repo.MarkSessionReminderSent(ctx, camp.RoomCode, "reminded2h")
+					msg := fmt.Sprintf(
+						"⏰ *Сбор отряда через 2 часа (%s)!*\nГотовьте листы персонажей, кубики и боевой настрой!",
+						localTimeStr,
+					)
+					if noteStr != "" {
+						msg += fmt.Sprintf("\n📝 *Заметка Мастера:* %s", noteStr)
+					}
+					_, _ = w.bot.Send(&tele.Chat{ID: camp.TelegramChatID}, msg, tele.ModeMarkdown)
+				}
+			}
+		}
 
 	}
 }

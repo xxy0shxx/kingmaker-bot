@@ -1468,3 +1468,272 @@ func (r *HeroRepository) GetSessionSummary(ctx context.Context, chatID, senderID
 
 	return sum, nil
 }
+
+type HeroSupplies struct {
+	Name        string
+	Rations     int
+	NormalIngr  int
+	SpecialIngr int
+}
+
+type RoomSupplies struct {
+	TotalRations     int
+	TotalNormalIngr  int
+	TotalSpecialIngr int
+	Heroes           []HeroSupplies
+}
+
+// GetRoomSupplies подсчитывает сухпайки и ингредиенты у всех активных героев комнаты
+func (r *HeroRepository) GetRoomSupplies(ctx context.Context, chatID, senderID int64, isPrivate bool) (*RoomSupplies, error) {
+	var roomCode string
+	if isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
+		`, senderID).Scan(&roomCode)
+		if err != nil {
+			return nil, fmt.Errorf("персонаж не привязан к кампании")
+		}
+	} else {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
+		`, chatID).Scan(&roomCode)
+		if err != nil {
+			return nil, fmt.Errorf("этот чат не привязан к игровой комнате")
+		}
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT hero_data FROM public.campaign_heroes WHERE room_code = $1 ORDER BY updated_at ASC
+	`, roomCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	res := &RoomSupplies{}
+
+	for rows.Next() {
+		var rawH []byte
+		if rows.Scan(&rawH) != nil {
+			continue
+		}
+		var hData map[string]any
+		if json.Unmarshal(rawH, &hData) != nil {
+			continue
+		}
+		if inactive, ok := hData["inactive"].(bool); ok && inactive {
+			continue
+		}
+
+		st := ensureStatsMap(hData)
+		hs := HeroSupplies{
+			Name: domain.GetStr(hData, "name", "Герой"),
+		}
+
+		for i := 1; i <= 15; i++ {
+			iName := strings.ToLower(strings.TrimSpace(domain.GetStr(st, fmt.Sprintf("item%dName", i), "")))
+			qty := domain.GetInt(st, fmt.Sprintf("item%dQty", i), 0)
+			if iName == "" || qty <= 0 {
+				continue
+			}
+
+			switch {
+			case strings.Contains(iName, "сух. па") || strings.Contains(iName, "паёк") || strings.Contains(iName, "паек") || strings.Contains(iName, "рацион"):
+				hs.Rations += qty
+			case strings.Contains(iName, "особые ингредиент"):
+				hs.SpecialIngr += qty
+			case strings.Contains(iName, "обычные ингредиент"):
+				hs.NormalIngr += qty
+			}
+		}
+
+		res.TotalRations += hs.Rations
+		res.TotalNormalIngr += hs.NormalIngr
+		res.TotalSpecialIngr += hs.SpecialIngr
+		res.Heroes = append(res.Heroes, hs)
+	}
+
+	return res, nil
+}
+
+// GetPlayerGroupChatID возвращает ID привязанного группового чата кампании игрока
+func (r *HeroRepository) GetPlayerGroupChatID(ctx context.Context, tgUserID int64) (int64, error) {
+	var chatID int64
+	err := r.db.QueryRow(ctx, `
+		SELECT COALESCE(cs.telegram_chat_id, 0)
+		FROM public.campaign_heroes ch
+		JOIN public.campaign_state cs ON cs.room_code = ch.room_code
+		WHERE ch.telegram_user_id = $1
+		LIMIT 1
+	`, tgUserID).Scan(&chatID)
+	if err != nil {
+		return 0, fmt.Errorf("персонаж не привязан к кампании")
+	}
+	if chatID == 0 {
+		return 0, fmt.Errorf("к вашей комнате ещё не привязан групповой чат")
+	}
+	return chatID, nil
+}
+
+type NextSessionInfo struct {
+	RoomCode       string
+	TelegramChatID int64
+	DateTimeISO    string // RFC3339 с таймзоной +07:00
+	Note           string
+	Reminded24h    bool
+	Reminded2h     bool
+}
+
+// SetNextSession сохраняет дату следующей сессии для комнаты (только для Мастера)
+func (r *HeroRepository) SetNextSession(ctx context.Context, chatID, senderID int64, isPrivate bool, isoTime, note string) (*NextSessionInfo, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var roomCode string
+	var groupChatID int64
+	var rawMap []byte
+
+	if !isPrivate {
+		err = tx.QueryRow(ctx, `
+			SELECT room_code, COALESCE(telegram_chat_id, 0), map_data
+			FROM public.campaign_state
+			WHERE telegram_chat_id = $1
+			FOR UPDATE
+		`, chatID).Scan(&roomCode, &groupChatID, &rawMap)
+	} else {
+		err = tx.QueryRow(ctx, `
+			SELECT cs.room_code, COALESCE(cs.telegram_chat_id, 0), cs.map_data
+			FROM public.campaign_heroes ch
+			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
+			WHERE ch.telegram_user_id = $1
+			FOR UPDATE
+		`, senderID).Scan(&roomCode, &groupChatID, &rawMap)
+		if err != nil {
+			err = tx.QueryRow(ctx, `
+				SELECT room_code, COALESCE(telegram_chat_id, 0), map_data
+				FROM public.campaign_state
+				WHERE telegram_chat_id IS NOT NULL AND telegram_chat_id <> 0
+				LIMIT 1
+				FOR UPDATE
+			`).Scan(&roomCode, &groupChatID, &rawMap)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("игровая комната не найдена")
+	}
+
+	var mapData map[string]any
+	if err := json.Unmarshal(rawMap, &mapData); err != nil {
+		return nil, err
+	}
+
+	if isoTime == "" {
+		delete(mapData, "nextSession")
+	} else {
+		mapData["nextSession"] = map[string]any{
+			"dateTimeISO": isoTime,
+			"note":        note,
+			"reminded24h": false,
+			"reminded2h":  false,
+		}
+	}
+
+	newBytes, err := json.Marshal(mapData)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE public.campaign_state SET map_data = $1::jsonb WHERE room_code = $2
+	`, string(newBytes), roomCode); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return &NextSessionInfo{
+		RoomCode:       roomCode,
+		TelegramChatID: groupChatID,
+		DateTimeISO:    isoTime,
+		Note:           note,
+	}, nil
+}
+
+// GetNextSession возвращает расписание следующей сессии для комнаты игрока или чата
+func (r *HeroRepository) GetNextSession(ctx context.Context, chatID, senderID int64, isPrivate bool) (*NextSessionInfo, error) {
+	var roomCode string
+	var groupChatID int64
+	var rawMap []byte
+
+	if !isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code, COALESCE(telegram_chat_id, 0), map_data
+			FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
+		`, chatID).Scan(&roomCode, &groupChatID, &rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("чат не привязан к комнате")
+		}
+	} else {
+		err := r.db.QueryRow(ctx, `
+			SELECT cs.room_code, COALESCE(cs.telegram_chat_id, 0), cs.map_data
+			FROM public.campaign_heroes ch
+			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
+			WHERE ch.telegram_user_id = $1 LIMIT 1
+		`, senderID).Scan(&roomCode, &groupChatID, &rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("персонаж не привязан к кампании")
+		}
+	}
+
+	var mapData map[string]any
+	if err := json.Unmarshal(rawMap, &mapData); err != nil {
+		return nil, err
+	}
+
+	ns, ok := mapData["nextSession"].(map[string]any)
+	if !ok || ns == nil {
+		return nil, nil
+	}
+
+	rem24, _ := ns["reminded24h"].(bool)
+	rem2, _ := ns["reminded2h"].(bool)
+
+	return &NextSessionInfo{
+		RoomCode:       roomCode,
+		TelegramChatID: groupChatID,
+		DateTimeISO:    domain.GetStr(ns, "dateTimeISO", ""),
+		Note:           domain.GetStr(ns, "note", ""),
+		Reminded24h:    rem24,
+		Reminded2h:     rem2,
+	}, nil
+}
+
+// MarkSessionReminderSent фиксирует, что напоминание (24h или 2h) уже отправлено
+func (r *HeroRepository) MarkSessionReminderSent(ctx context.Context, roomCode, fieldKey string) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var rawMap []byte
+	if err := tx.QueryRow(ctx, `SELECT map_data FROM public.campaign_state WHERE room_code = $1 FOR UPDATE`, roomCode).Scan(&rawMap); err != nil {
+		return err
+	}
+	var mapData map[string]any
+	if err := json.Unmarshal(rawMap, &mapData); err != nil {
+		return err
+	}
+	if ns, ok := mapData["nextSession"].(map[string]any); ok && ns != nil {
+		ns[fieldKey] = true
+		if updated, err := json.Marshal(mapData); err == nil {
+			_, _ = tx.Exec(ctx, `UPDATE public.campaign_state SET map_data = $1::jsonb WHERE room_code = $2`, string(updated), roomCode)
+		}
+	}
+	return tx.Commit(ctx)
+}

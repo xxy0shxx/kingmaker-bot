@@ -111,6 +111,12 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle("/summary", h.handleSessionSummary)
 	b.Handle(&tele.Btn{Unique: "sum_pub"}, h.handlePublishSummaryCallback)
 
+	b.Handle("/rations", h.handleRationsCommand)
+
+	b.Handle("/vote", h.handleVoteCommand)
+
+	b.Handle("/session", h.handleSessionCommand)
+
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
@@ -2619,8 +2625,10 @@ func (h *BotHandler) tryAnswerBerestaRoomQuery(ctx context.Context, c tele.Conte
 	isWounded := containsAny(lower, "кто ранен", "здоров", "пз отряда", "хит", "лечить кого", "состояние отряда")
 	isRich := containsAny(lower, "самый богатый", "у кого больше золота", "у кого деньги", "кошел")
 	isQuests := containsAny(lower, "квест", "задан", "слух", "зацепк", "поручен", "мисси", "что делать", "куда дальше")
+	isRations := containsAny(lower, "паек", "пайк", "сухпа", "ед", "провиз", "ингредиент", "припас", "сколько дней")
+	isSession := containsAny(lower, "когда игра", "когда сесси", "следующая игра", "следующая сесси", "расписан", "доска объявлен", "сбор отряда")
 
-	if !isTreasury && !isShop && !isLocation && !isWounded && !isRich && !isQuests {
+	if !isTreasury && !isShop && !isLocation && !isWounded && !isRich && !isQuests && !isRations && !isSession {
 		return "", false
 	}
 
@@ -2630,6 +2638,11 @@ func (h *BotHandler) tryAnswerBerestaRoomQuery(ctx context.Context, c tele.Conte
 	}
 
 	switch {
+	case isSession:
+		return h.formatNextSessionInfo(ctx, c), true
+	case isRations:
+		return h.formatRoomSupplies(ctx, c), true
+
 	case isQuests:
 		return h.formatRoomQuestsAndRumors(ctx, c), true
 
@@ -2849,4 +2862,199 @@ func (h *BotHandler) handlePublishSummaryCallback(c tele.Context) error {
 	}
 
 	return c.Edit("✅ <b>Хроника дня опубликована в групповой чат партии!</b>", tele.ModeHTML)
+}
+
+// --- Учёт сухпайков и ингредиентов отряда ---
+
+func (h *BotHandler) handleRationsCommand(c tele.Context) error {
+	msg := h.formatRoomSupplies(context.Background(), c)
+	return c.Send(msg, tele.ModeHTML)
+}
+
+func (h *BotHandler) formatRoomSupplies(ctx context.Context, c tele.Context) string {
+	sup, err := h.repo.GetRoomSupplies(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+	if err != nil {
+		return fmt.Sprintf("🪶 Посмотрел в походную кладовую, но %s.", html.EscapeString(err.Error()))
+	}
+
+	if len(sup.Heroes) == 0 {
+		return "🎒 В этой кампании пока нет активных героев."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("🍞 <b>Походные припасы и ингредиенты отряда</b>\n")
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("📦 <b>Всего в наличии:</b>\n• Сухпайки: <code>%d дн.</code>\n• Обычные ингредиенты: <code>%d шт.</code>\n• Особые ингредиенты: <code>%d шт.</code>\n\n",
+		sup.TotalRations, sup.TotalNormalIngr, sup.TotalSpecialIngr))
+
+	sb.WriteString("🛡️ <b>Распределение по рюкзакам:</b>\n")
+	for _, hs := range sup.Heroes {
+		warn := ""
+		if hs.Rations == 0 {
+			warn = " ⚠️ <i>(нет пайков!)</i>"
+		}
+		sb.WriteString(fmt.Sprintf("• <b>%s:</b> 🍞 <code>%d</code> • 🏕️ <code>%d</code> • 🌿 <code>%d</code>%s\n",
+			html.EscapeString(hs.Name), hs.Rations, hs.NormalIngr, hs.SpecialIngr, warn))
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+// --- Голосование партии по маршруту (/vote) ---
+
+func (h *BotHandler) handleVoteCommand(c tele.Context) error {
+	raw := strings.TrimSpace(c.Message().Payload)
+	if raw == "" {
+		return c.Send(
+			"🧭 <b>Голосование отряда по маршруту</b>\n"+
+				"━━━━━━━━━━━━━━━━━━━━\n"+
+				"Укажите вопрос и варианты через символ <code>|</code> (от 2 до 10 вариантов):\n\n"+
+				"<code>/vote Куда идём дальше? | На пост Олега | В Паучье логово | В Скрюченные топи</code>",
+			tele.ModeHTML,
+		)
+	}
+
+	parts := strings.Split(raw, "|")
+	var cleaned []string
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+
+	if len(cleaned) < 3 {
+		return c.Send(
+			"⚠️ Нужно указать вопрос и минимум <b>2 варианта</b> ответа через <code>|</code>.\nПример: <code>/vote Что делаем? | Разбиваем лагерь | Идём дальше</code>",
+			tele.ModeHTML,
+		)
+	}
+
+	question := cleaned[0]
+	options := cleaned[1:]
+	if len(options) > 10 {
+		options = options[:10]
+	}
+
+	poll := &tele.Poll{
+		Question:  "🧭 " + question,
+		Anonymous: false,
+	}
+	poll.AddOptions(options...)
+
+	// Если команда отправлена в групповом чате — запускаем опрос прямо там
+	if c.Chat().Type != tele.ChatPrivate {
+		return c.Send(poll)
+	}
+
+	// Если отправлено в ЛС — публикуем опрос в групповой чат кампании игрока
+	groupChatID, err := h.repo.GetPlayerGroupChatID(context.Background(), c.Sender().ID)
+	if err != nil {
+		return c.Send(fmt.Sprintf("⚠️ Не удалось запустить опрос в группе: %s.", html.EscapeString(err.Error())))
+	}
+
+	if _, err := c.Bot().Send(&tele.Chat{ID: groupChatID}, poll); err != nil {
+		return c.Send(fmt.Sprintf("❌ Ошибка отправки опроса в чат партии: %v", err))
+	}
+
+	return c.Send("✅ Голосование запущено в групповом чате партии!")
+}
+
+// --- Доска объявлений / Напоминание о следующей сессии (/session) ---
+
+func (h *BotHandler) handleSessionCommand(c tele.Context) error {
+	raw := strings.TrimSpace(c.Message().Payload)
+	isPriv := c.Chat().Type == tele.ChatPrivate
+
+	// Просмотр расписания (доступен всем участникам)
+	if raw == "" {
+		return c.Send(h.formatNextSessionInfo(context.Background(), c), tele.ModeHTML)
+	}
+
+	// Изменение расписания — только для Мастера
+	if !IsAdmin(c.Sender().ID) {
+		return c.Send("⛔ Назначать или отменять дату сессии может только Мастер кампании.")
+	}
+
+	lowerRaw := strings.ToLower(raw)
+	if lowerRaw == "отмена" || lowerRaw == "clear" || lowerRaw == "удалить" {
+		if _, err := h.repo.SetNextSession(context.Background(), c.Chat().ID, c.Sender().ID, isPriv, "", ""); err != nil {
+			return c.Send(fmt.Sprintf("❌ Ошибка: %s", html.EscapeString(err.Error())))
+		}
+		return c.Send("🗑️ Объявление о следующей сессии снято с доски.")
+	}
+
+	datePart, notePart, _ := strings.Cut(raw, "|")
+	datePart = strings.TrimSpace(datePart)
+	notePart = strings.TrimSpace(notePart)
+
+	loc := time.FixedZone("NSK", 7*3600)
+	parsedTime, err := time.ParseInLocation("02.01.2006 15:04", datePart, loc)
+	if err != nil {
+		return c.Send(
+			"⚠️ Неверный формат даты. Используйте:\n<code>/session ДД.ММ.ГГГГ ЧЧ:ММ | Заметка</code>\n\nПример:\n<code>/session 22.11.2026 19:00 | Штурм лагеря разбойников</code>",
+			tele.ModeHTML,
+		)
+	}
+
+	info, err := h.repo.SetNextSession(context.Background(), c.Chat().ID, c.Sender().ID, isPriv, parsedTime.Format(time.RFC3339), notePart)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Не удалось сохранить дату сессии: %s", html.EscapeString(err.Error())))
+	}
+
+	announce := fmt.Sprintf(
+		"📌 <b>Доска объявлений: назначена следующая сессия!</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"🗓️ <b>Когда:</b> <code>%s</code>\n",
+		parsedTime.Format("02.01.2006 в 15:04"),
+	)
+	if notePart != "" {
+		announce += fmt.Sprintf("📝 <b>Заметка Мастера:</b> %s\n", html.EscapeString(notePart))
+	}
+	announce += "\n<i>🔔 Береста напомнит отряду за 24 часа и за 2 часа до начала.</i>"
+
+	if isPriv && info.TelegramChatID != 0 {
+		_, _ = c.Bot().Send(&tele.Chat{ID: info.TelegramChatID}, announce, tele.ModeHTML)
+		return c.Send("✅ Дата следующей сессии сохранена и опубликована в групповой чат партии!")
+	}
+
+	return c.Send(announce, tele.ModeHTML)
+}
+
+func (h *BotHandler) formatNextSessionInfo(ctx context.Context, c tele.Context) string {
+	info, err := h.repo.GetNextSession(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+	if err != nil {
+		return fmt.Sprintf("🪶 Посмотрел на доску объявлений, но %s.", html.EscapeString(err.Error()))
+	}
+	if info == nil || info.DateTimeISO == "" {
+		return "📌 <b>Доска объявлений пуста:</b>\nМастер пока не назначил дату следующей сессии."
+	}
+
+	loc := time.FixedZone("NSK", 7*3600)
+	t, err := time.Parse(time.RFC3339, info.DateTimeISO)
+	if err != nil {
+		return "📌 Следующая сессия назначена, но дата записана в нестандартном формате."
+	}
+
+	localStr := t.In(loc).Format("02.01.2006 в 15:04")
+	until := time.Until(t)
+	countdown := "сессия уже началась или прошла"
+	if until > 0 {
+		days := int(until.Hours()) / 24
+		hours := int(until.Hours()) % 24
+		mins := int(until.Minutes()) % 60
+		if days > 0 {
+			countdown = fmt.Sprintf("через %d дн. %d ч.", days, hours)
+		} else {
+			countdown = fmt.Sprintf("через %d ч. %d мин.", hours, mins)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📌 <b>Ближайшая игровая сессия</b>\n")
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("🗓️ <b>Дата и время:</b> <code>%s</code> (%s)\n", localStr, countdown))
+	if info.Note != "" {
+		sb.WriteString(fmt.Sprintf("📝 <b>Заметка Мастера:</b> %s\n", html.EscapeString(info.Note)))
+	}
+	return strings.TrimSpace(sb.String())
 }
