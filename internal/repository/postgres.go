@@ -1061,8 +1061,14 @@ type RoomSituation struct {
 
 // GetRoomSituation возвращает актуальную сводку по комнате для ответа Бересты (строго в пределах room_code)
 func (r *HeroRepository) GetRoomSituation(ctx context.Context, chatID, senderID int64, isPrivate bool) (*RoomSituation, error) {
-	var roomCode string
+	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
+	if err != nil {
+		return nil, err
+	}
 	var rawMap []byte
+	if err := r.db.QueryRow(ctx, `SELECT map_data FROM public.campaign_state WHERE room_code = $1 LIMIT 1`, roomCode).Scan(&rawMap); err != nil {
+		return nil, fmt.Errorf("данные карты не найдены")
+	}
 
 	if isPrivate {
 		err := r.db.QueryRow(ctx, `
@@ -1224,7 +1230,14 @@ type RoomLeads struct {
 
 // GetRoomQuestsAndRumors собирает все квесты и слухи с гексов конкретной комнаты
 func (r *HeroRepository) GetRoomQuestsAndRumors(ctx context.Context, chatID, senderID int64, isPrivate bool) (*RoomLeads, error) {
+	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
+	if err != nil {
+		return nil, err
+	}
 	var rawMap []byte
+	if err := r.db.QueryRow(ctx, `SELECT map_data FROM public.campaign_state WHERE room_code = $1 LIMIT 1`, roomCode).Scan(&rawMap); err != nil {
+		return nil, err
+	}
 	if isPrivate {
 		err := r.db.QueryRow(ctx, `
 			SELECT cs.map_data
@@ -1493,7 +1506,10 @@ type RoomSupplies struct {
 
 // GetRoomSupplies подсчитывает сухпайки и ингредиенты у всех активных героев комнаты
 func (r *HeroRepository) GetRoomSupplies(ctx context.Context, chatID, senderID int64, isPrivate bool) (*RoomSupplies, error) {
-	var roomCode string
+	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
+	if err != nil {
+		return nil, err
+	}
 	if isPrivate {
 		err := r.db.QueryRow(ctx, `
 			SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
@@ -1566,19 +1582,19 @@ func (r *HeroRepository) GetRoomSupplies(ctx context.Context, chatID, senderID i
 
 // GetPlayerGroupChatID возвращает ID привязанного группового чата кампании игрока
 func (r *HeroRepository) GetPlayerGroupChatID(ctx context.Context, tgUserID int64) (int64, error) {
-	var chatID int64
-	err := r.db.QueryRow(ctx, `
-		SELECT COALESCE(cs.telegram_chat_id, 0)
-		FROM public.campaign_heroes ch
-		JOIN public.campaign_state cs ON cs.room_code = ch.room_code
-		WHERE ch.telegram_user_id = $1
-		LIMIT 1
-	`, tgUserID).Scan(&chatID)
+	roomCode, err := r.resolveRoomCode(ctx, 0, tgUserID, true)
 	if err != nil {
-		return 0, fmt.Errorf("персонаж не привязан к кампании")
+		return 0, err
 	}
-	if chatID == 0 {
-		return 0, fmt.Errorf("к вашей комнате ещё не привязан групповой чат")
+	var chatID int64
+	err = r.db.QueryRow(ctx, `
+		SELECT COALESCE(telegram_chat_id, 0)
+		FROM public.campaign_state
+		WHERE room_code = $1
+		LIMIT 1
+	`, roomCode).Scan(&chatID)
+	if err != nil || chatID == 0 {
+		return 0, fmt.Errorf("к комнате ещё не привязан групповой чат")
 	}
 	return chatID, nil
 }
@@ -1674,9 +1690,17 @@ func (r *HeroRepository) SetNextSession(ctx context.Context, chatID, senderID in
 
 // GetNextSession возвращает расписание следующей сессии для комнаты игрока или чата
 func (r *HeroRepository) GetNextSession(ctx context.Context, chatID, senderID int64, isPrivate bool) (*NextSessionInfo, error) {
-	var roomCode string
+	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
+	if err != nil {
+		return nil, err
+	}
 	var groupChatID int64
 	var rawMap []byte
+	if err := r.db.QueryRow(ctx, `
+		SELECT COALESCE(telegram_chat_id, 0), map_data FROM public.campaign_state WHERE room_code = $1 LIMIT 1
+	`, roomCode).Scan(&groupChatID, &rawMap); err != nil {
+		return nil, err
+	}
 
 	if !isPrivate {
 		err := r.db.QueryRow(ctx, `
@@ -1748,7 +1772,10 @@ func (r *HeroRepository) MarkSessionReminderSent(ctx context.Context, roomCode, 
 
 // GetRoomActiveHeroes возвращает список активных персонажей комнаты для текущего чата или личных сообщений
 func (r *HeroRepository) GetRoomActiveHeroes(ctx context.Context, chatID, senderID int64, isPrivate bool) ([]domain.HeroRecord, error) {
-	var roomCode string
+	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
+	if err != nil {
+		return nil, err
+	}
 	if isPrivate {
 		err := r.db.QueryRow(ctx, `
 			SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
@@ -1789,4 +1816,38 @@ func (r *HeroRepository) GetRoomActiveHeroes(ctx context.Context, chatID, sender
 		}
 	}
 	return list, nil
+}
+
+// resolveRoomCode находит room_code по чату или по привязанному герою (с резервом для Мастера без героя)
+func (r *HeroRepository) resolveRoomCode(ctx context.Context, chatID, senderID int64, isPrivate bool) (string, error) {
+	var roomCode string
+	if !isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
+		`, chatID).Scan(&roomCode)
+		if err != nil {
+			return "", fmt.Errorf("этот чат не привязан к игровой комнате")
+		}
+		return roomCode, nil
+	}
+
+	// 1. Ищем комнату по привязанному персонажу игрока
+	err := r.db.QueryRow(ctx, `
+		SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
+	`, senderID).Scan(&roomCode)
+	if err == nil && roomCode != "" {
+		return roomCode, nil
+	}
+
+	// 2. Резерв для Мастера (у которого нет своего героя): берём активную комнату с привязанным чатом
+	err = r.db.QueryRow(ctx, `
+		SELECT room_code FROM public.campaign_state
+		WHERE telegram_chat_id IS NOT NULL AND telegram_chat_id <> 0
+		LIMIT 1
+	`).Scan(&roomCode)
+	if err == nil && roomCode != "" {
+		return roomCode, nil
+	}
+
+	return "", fmt.Errorf("персонаж не привязан к кампании")
 }
