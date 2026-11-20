@@ -43,7 +43,10 @@ func main() {
 	gearStore := catalog.NewGearStore(os.Getenv("GEAR_CATALOG_URL"), "gear_cache.json")
 	go gearStore.Start(ctx)
 
-	handler := telegram.NewBotHandler(repo, gearStore)
+	compendiumStore := catalog.NewCompendiumStore(os.Getenv("COMPENDIUM_CATALOG_URL"), "compendium_cache.json")
+	go compendiumStore.Start(ctx)
+
+	handler := telegram.NewBotHandler(repo, gearStore, compendiumStore)
 	handler.Register(b)
 
 	mapWatcher := watcher.NewMapWatcher(repo, b)

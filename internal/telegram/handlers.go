@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"html"
 	"log"
-	"math/rand"
 	"os"
 	"regexp"
 	"strconv"
@@ -28,27 +27,30 @@ type pendingCoinTx struct {
 }
 
 type BotHandler struct {
-	repo                *repository.HeroRepository
-	gear                *catalog.GearStore
-	mainMenu            *tele.ReplyMarkup
-	adminMenu           *tele.ReplyMarkup
-	btnMe               tele.Btn
-	btnSpell            tele.Btn
-	btnEquip            tele.Btn
-	btnShop             tele.Btn
-	btnGive             tele.Btn
-	btnPay              tele.Btn
-	btnWeb              tele.Btn
-	btnAdmin            tele.Btn
-	pendingPays         sync.Map
-	pendingShopSearches sync.Map
-	pendingAdminVotes   sync.Map
-	lastMentionReply    sync.Map
-	mutedChats          sync.Map
-	activePolls         sync.Map
+	repo                      *repository.HeroRepository
+	gear                      *catalog.GearStore
+	compendium                *catalog.CompendiumStore
+	mainMenu                  *tele.ReplyMarkup
+	adminMenu                 *tele.ReplyMarkup
+	btnMe                     tele.Btn
+	btnSpell                  tele.Btn
+	btnEquip                  tele.Btn
+	btnShop                   tele.Btn
+	btnGive                   tele.Btn
+	btnPay                    tele.Btn
+	btnCompendium             tele.Btn
+	btnWeb                    tele.Btn
+	btnAdmin                  tele.Btn
+	pendingPays               sync.Map
+	pendingShopSearches       sync.Map
+	pendingCompendiumSearches sync.Map
+	pendingAdminVotes         sync.Map
+	lastMentionReply          sync.Map
+	mutedChats                sync.Map
+	activePolls               sync.Map
 }
 
-func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore) *BotHandler {
+func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore, compendium *catalog.CompendiumStore) *BotHandler {
 	menu := &tele.ReplyMarkup{ResizeKeyboard: true}
 	btnMe := menu.Text("🛡️ Мой персонаж")
 	btnSpell := menu.Text("✨ Заклинания и рюкзак")
@@ -56,12 +58,13 @@ func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore) *Bo
 	btnShop := menu.Text("🏪 Магазин")
 	btnGive := menu.Text("🎁 Передать вещь")
 	btnPay := menu.Text("💸 Передать монеты")
+	btnCompendium := menu.Text("📚 Справочник")
 	btnWeb := menu.Text("🌐 Веб-лист и карта")
 	menu.Reply(
 		menu.Row(btnMe, btnSpell),
 		menu.Row(btnEquip, btnShop),
 		menu.Row(btnGive, btnPay),
-		menu.Row(btnWeb),
+		menu.Row(btnCompendium, btnWeb),
 	)
 
 	admMenu := &tele.ReplyMarkup{ResizeKeyboard: true}
@@ -70,22 +73,25 @@ func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore) *Bo
 		admMenu.Row(btnMe, btnSpell),
 		admMenu.Row(btnEquip, btnShop),
 		admMenu.Row(btnGive, btnPay),
-		admMenu.Row(btnWeb, btnAdmin),
+		admMenu.Row(btnCompendium, btnWeb),
+		admMenu.Row(btnAdmin),
 	)
 
 	return &BotHandler{
-		repo:      repo,
-		gear:      gear,
-		mainMenu:  menu,
-		adminMenu: admMenu,
-		btnMe:     btnMe,
-		btnSpell:  btnSpell,
-		btnEquip:  btnEquip,
-		btnShop:   btnShop,
-		btnGive:   btnGive,
-		btnPay:    btnPay,
-		btnWeb:    btnWeb,
-		btnAdmin:  btnAdmin,
+		repo:          repo,
+		gear:          gear,
+		compendium:    compendium,
+		mainMenu:      menu,
+		adminMenu:     admMenu,
+		btnMe:         btnMe,
+		btnSpell:      btnSpell,
+		btnEquip:      btnEquip,
+		btnShop:       btnShop,
+		btnGive:       btnGive,
+		btnPay:        btnPay,
+		btnCompendium: btnCompendium,
+		btnWeb:        btnWeb,
+		btnAdmin:      btnAdmin,
 	}
 }
 
@@ -125,6 +131,12 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&tele.Btn{Unique: "shop_item"}, h.handleShopItemView)
 	b.Handle(&tele.Btn{Unique: "shop_buy"}, h.handleShopBuyExec)
 
+	b.Handle(&h.btnCompendium, h.handleCompendiumMenu)
+	b.Handle(&tele.Btn{Unique: "comp_home"}, h.handleCompendiumHomeCallback)
+	b.Handle(&tele.Btn{Unique: "comp_cat"}, h.handleCompendiumCategoryCallback)
+	b.Handle(&tele.Btn{Unique: "comp_find"}, h.handleCompendiumSearchPrompt)
+	b.Handle(&tele.Btn{Unique: "comp_view"}, h.handleCompendiumViewCallback)
+
 	b.Handle("/rule", h.handleRuleCommand)
 	b.Handle(&tele.Btn{Unique: "rule_cat"}, h.handleRuleCategoryCallback)
 	b.Handle(&tele.Btn{Unique: "rule_view"}, h.handleRuleViewCallback)
@@ -149,6 +161,13 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&h.btnAdmin, h.handleAdminMenu)
 	b.Handle(&tele.Btn{Unique: "adm"}, h.handleAdminAction)
 
+	b.Handle("/pf", h.handleCompendiumCommand)
+	b.Handle("/find", h.handleCompendiumCommand)
+	b.Handle("/spell", h.handleSpellLookupCommand)
+	b.Handle("/feat", h.handleFeatLookupCommand)
+	b.Handle("/action", h.handleActionLookupCommand)
+	b.Handle(&tele.Btn{Unique: "comp_view"}, h.handleCompendiumViewCallback)
+
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
@@ -159,6 +178,7 @@ func (h *BotHandler) Register(b *tele.Bot) {
 		_ = c.Respond()
 		h.pendingPays.Delete(c.Sender().ID)
 		h.pendingShopSearches.Delete(c.Sender().ID)
+		h.pendingCompendiumSearches.Delete(c.Sender().ID)
 		h.pendingAdminVotes.Delete(c.Sender().ID)
 		return c.Edit("❌ Операция отменена.")
 	})
@@ -569,6 +589,15 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 		return h.sendShopSearchResults(c, q, 0)
 	}
 
+	if _, searchingComp := h.pendingCompendiumSearches.Load(tgID); searchingComp {
+		q := strings.TrimSpace(c.Text())
+		h.pendingCompendiumSearches.Delete(tgID)
+		if q == "" || strings.HasPrefix(q, "/") {
+			return nil
+		}
+		return h.sendCompendiumLookup(c, q, "all", "")
+	}
+
 	text := strings.TrimSpace(c.Text())
 	log.Printf("[MSG] chat=%d user=%s (%d): %q", c.Chat().ID, c.Sender().FirstName, tgID, text)
 
@@ -648,7 +677,24 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 					return c.Reply(fmt.Sprintf("🗡️ <b>Нашёл несколько предметов по запросу «%s»:</b>", html.EscapeString(itemQuery)), inline, tele.ModeHTML)
 				}
 			}
-
+			if compQuery, compKind, isCompReq := extractBerestaCompendiumQuery(text); isCompReq && h.compendium != nil {
+				matches := h.compendium.Search(compQuery, compKind)
+				if len(matches) == 1 {
+					return c.Reply(formatCompendiumCardHTML(matches[0]), tele.ModeHTML)
+				}
+				if len(matches) > 1 {
+					if len(matches) > 8 {
+						matches = matches[:8]
+					}
+					inline := &tele.ReplyMarkup{}
+					var rows []tele.Row
+					for _, m := range matches {
+						rows = append(rows, inline.Row(inline.Data(fmt.Sprintf("%s (%s)", m.Name, m.Category), "comp_view", m.ID)))
+					}
+					inline.Inline(rows...)
+					return c.Reply(fmt.Sprintf("📚 <b>Нашёл несколько записей по запросу «%s»:</b>", html.EscapeString(compQuery)), inline, tele.ModeHTML)
+				}
+			}
 			if replyText, handled := h.tryAnswerBerestaRoomQuery(context.Background(), c, text); handled {
 				return c.Reply(replyText, tele.ModeHTML)
 			}
@@ -1058,6 +1104,10 @@ func (h *BotHandler) handleStatus(c tele.Context) error {
 	if h.gear != nil {
 		gearCount = h.gear.Count()
 	}
+	compendiumCount := 0
+	if h.compendium != nil {
+		compendiumCount = h.compendium.Count()
+	}
 
 	msg := fmt.Sprintf(
 		"📊 <b>Статус системы Kingmaker Bot</b>\n"+
@@ -1068,6 +1118,7 @@ func (h *BotHandler) handleStatus(c tele.Context) error {
 			"💬 <b>Привязанных групповых чатов:</b> <code>%d</code>\n"+
 			"🛡️ <b>Героев в базе:</b> <code>%d</code> (привязано к TG: <code>%d</code>)\n"+
 			"📦 <b>Каталог магазина:</b> <code>%d</code> поз.\n"+
+			"📚 <b>Справочник PF2e:</b> <code>%d</code> зап.\n"+
 			"📬 <b>Очередь уведомлений:</b> <code>%d</code>",
 		html.EscapeString(st.WebVersion), webUrlStatus,
 		html.EscapeString(st.BotVersion), botUrlStatus,
@@ -1075,6 +1126,7 @@ func (h *BotHandler) handleStatus(c tele.Context) error {
 		st.TrackedChats,
 		st.TotalHeroes, st.LinkedHeroes,
 		gearCount,
+		compendiumCount,
 		st.PendingQueue,
 	)
 
@@ -2129,41 +2181,7 @@ func (h *BotHandler) handlePhotoMessage(c tele.Context) error {
 		speakerName = domain.GetStr(hero.Data, "name", speakerName)
 	}
 
-	replies := []string{
-		fmt.Sprintf("🐾 Выглянул из-за ширмы, пошевелил ушами... Ого, *%s*, вот это картинка! Жаль, у меня лапки — перерисовать такое в свиток не выйдет.", speakerName),
-		fmt.Sprintf("🐈‍⬛ Мяу? *%s*, я, конечно, кот-летописец, но даже мои круглые глаза такого ещё не видали!", speakerName),
-		fmt.Sprintf("🖼️ Потыкал лапкой в изображение от *%s*... Вроде не кусается и не пахнет рыбой, но в архив занесу!", speakerName),
-		fmt.Sprintf("👀 Высунул чёрную макушку из-за ширмы Мастера: и что это мы тут рассматриваем, *%s*?", speakerName),
-		fmt.Sprintf("📜 Записал в хронику: «*%s* предъявил отряду загадочное полотно». Надеюсь, это не портрет нашего следующего босса?", speakerName),
-		fmt.Sprintf("🐾 Прошёл мягкими лапками прямо по свежему оттиску... Ой, *%s*, теперь там мои следы! Будем считать это печатью архива.", speakerName),
-		fmt.Sprintf("🎨 Художники Авессалома обзавидовались бы такой иллюстрации, *%s*! Мур-р-р, одобряю.", speakerName),
-		fmt.Sprintf("🧐 Прищурился, дёрнул усом... Любопытный кадр, *%s*! Спрячу его за ширму рядом с любимым d20.", speakerName),
-		fmt.Sprintf("🐈‍⬛ Засмотрелся на картинку от *%s* так, что случайно смахнул хвостом чернильницу со стола!", speakerName),
-		fmt.Sprintf("🔍 Обнюхал картинку со всех углов, *%s* — пахнет приключениями и немножко жареной курицей!", speakerName),
-		fmt.Sprintf("🐾 *%s*, я пытался поймать лапой то, что нарисовано на картинке, но поцарапал только пергамент!", speakerName),
-		fmt.Sprintf("📖 Вклеить это в летопись у меня лапки не дотянутся, *%s*, но я запомню во всех пушистых подробностях!", speakerName),
-		fmt.Sprintf("😼 Хм-м-м, *%s*... Выглядит подозрительно! Кидаем проверку Внимания или сразу шипим и выгибаем спину?", speakerName),
-		fmt.Sprintf("🎲 Закатил кубик под ширму от удивления, *%s*! Где ты только такие кадры откапываешь?", speakerName),
-		fmt.Sprintf("🐈‍⬛ Уши на макушке, глаза по пять золотых — Береста внимательно изучает шедевр от *%s*!", speakerName),
-		fmt.Sprintf("🖼️ Повешу это на внутреннюю сторону ширмы Мастера для вдохновения, *%s*!", speakerName),
-		fmt.Sprintf("🐾 Топ-топ лапками по столу... Подошёл поближе разглядеть твою картинку, *%s*. Годно!", speakerName),
-		fmt.Sprintf("🪶 Попытался зарисовать это гусиным пером, *%s*, но получился только клубок шерсти и две кляксы.", speakerName),
-		fmt.Sprintf("😺 Мур! Вот ради таких картинок в чате я и терплю ваши бесконечные споры у закрытых дверей, *%s*!", speakerName),
-		fmt.Sprintf("🕯️ Подтащил свечу поближе к изображению от *%s*... Осторожно, чуть усы не опалил!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *%s*, если это карта сокровищ — я первый в очереди за долей в виде сметаны и блестящих монеток!", speakerName),
-		fmt.Sprintf("👀 Смотрю в оба глаза, *%s*! Ни одна деталь мимо пушистого архивариуса не проскочит.", speakerName),
-		fmt.Sprintf("🎭 Ох уж эти ваши художества, *%s*! Аж хвост трубой встал от неожиданности.", speakerName),
-		fmt.Sprintf("📜 Заношу в раздел «Наглядные улики»: «*%s* притащил в лагерь нечто любопытное».", speakerName),
-		fmt.Sprintf("🐾 Поскрёб когтем по рамке... Красивое, *%s*! Но сбрасывать со стола я это, так и быть, не буду.", speakerName),
-		fmt.Sprintf("😼 *%s*, судя по этому изображению, нас впереди ждёт либо великая добыча, либо великий кусь!", speakerName),
-		fmt.Sprintf("🔮 Поглядел на картинку сквозь граненый d20, *%s*... Похоже, это к скорой встрече с неприятностями!", speakerName),
-		fmt.Sprintf("🐈‍⬛ Свернулся калачиком рядом с этой иллюстрацией, *%s* — уж больно уютный кадр!", speakerName),
-		fmt.Sprintf("🖌️ Отличная работа, *%s*! Выписываю тебе официальное «Мяу одобрения» от хранителя архивов.", speakerName),
-		fmt.Sprintf("🐾 Выглянул из-за ширмы на шум, а тут *%s* красоту показывает! Продолжайте, я наблюдаю.", speakerName),
-	}
-
-	reply := replies[rand.Intn(len(replies))]
-	return c.Reply(reply, tele.ModeMarkdown)
+	return c.Reply(buildPhotoReply(speakerName), tele.ModeMarkdown)
 }
 
 var ignoredNameWords = map[string]bool{
@@ -2572,17 +2590,22 @@ func (h *BotHandler) handleAdminAction(c tele.Context) error {
 		if h.gear != nil {
 			gearCount = h.gear.Count()
 		}
+		compendiumCount := 0
+		if h.compendium != nil {
+			compendiumCount = h.compendium.Count()
+		}
 		msg := fmt.Sprintf(
 			"📊 <b>Статус системы</b>\n━━━━━━━━━━━━━━━━━━━━\n"+
 				"🌐 <b>Веб:</b> <code>%s</code> • 🤖 <b>Бот:</b> <code>%s</code>\n"+
 				"🔄 <b>Вотчер релизов:</b> %s\n"+
 				"💬 <b>Чатов:</b> <code>%d</code> • 🛡️ <b>Героев:</b> <code>%d</code> (TG: <code>%d</code>)\n"+
-				"📦 <b>Каталог:</b> <code>%d</code> поз. • 📬 <b>Очередь:</b> <code>%d</code>",
+				"📦 <b>Магазин:</b> <code>%d</code> поз. • 📚 <b>Справочник:</b> <code>%d</code> зап.\n"+
+				"📬 <b>Очередь уведомлений:</b> <code>%d</code>",
 			html.EscapeString(st.WebVersion), html.EscapeString(st.BotVersion),
-			watcherState, st.TrackedChats, st.TotalHeroes, st.LinkedHeroes, gearCount, st.PendingQueue,
+			watcherState, st.TrackedChats, st.TotalHeroes, st.LinkedHeroes,
+			gearCount, compendiumCount, st.PendingQueue,
 		)
 		return c.Edit(msg, backMarkup, tele.ModeHTML)
-
 	case "toggle_mute":
 		targetChatID := c.Chat().ID
 		if c.Chat().Type == tele.ChatPrivate {
@@ -2853,61 +2876,7 @@ func (h *BotHandler) handleStickerMessage(c tele.Context) error {
 		speakerName = domain.GetStr(hero.Data, "name", speakerName)
 	}
 
-	replies := []string{
-		fmt.Sprintf("🐾 *Выглянул из-за ширмы на художество %s!* О-о-о, вот это я понимаю — настоящая классика подземелий и драконов!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Потыкал мягкой лапкой в стикер от %s.* Мур-р-р, прямо как иллюстрация из старинного бестиария Авессалома!", speakerName),
-		fmt.Sprintf("📜 *Бережно вклеиваю этот шедевр от %s в летопись отряда!* Пусть потомки видят, какие страсти кипели у костра!", speakerName),
-		fmt.Sprintf("🎲 *Закатил d20 под ширму от такого стикера, %s!* Настрой у партии явно на двадцатку!", speakerName),
-		fmt.Sprintf("👀 *Прищурил жёлтые глаза на картинку %s.* До боли знакомая сцена... Это мы в прошлом подземелье так выглядели?", speakerName),
-		fmt.Sprintf("🪶 *Поправил невидимые очки на носу:* Та-а-ак, *%s*, в раздел «Наскальная живопись авантюристов» прибыло!", speakerName),
-		fmt.Sprintf("🕯️ *Подтащил свечу поближе к стикеру %s...* Осторожно, чуть усы не опалил, но картинка того стоила!", speakerName),
-		fmt.Sprintf("🎭 *Бард в углу аж лютню отложил, глядя на стикер %s!* Вот это я понимаю — выразительность без лишних слов!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Свернулся калачиком рядом со стикером %s.* Душевный рисунок, одобряю всеми четырьмя лапами!", speakerName),
-		fmt.Sprintf("📖 *Перелистал гримуар:* Хм, *%s*, заклинание вызова таких картинок явно требует как минимум третий круг магии!", speakerName),
-		fmt.Sprintf("✨ *Дзынь!* Сургучная печать архива ставится на этот стикер от *%s* без малейших колебаний!", speakerName),
-		fmt.Sprintf("😼 *%s*, признайся, ты этот стикерпак специально в походном поясе быстрого доступа таскаешь?", speakerName),
-		fmt.Sprintf("🐾 *Поскрёб когтем по рамке стикера %s.* Красивое! Сбрасывать со стола не буду, так и быть.", speakerName),
-		fmt.Sprintf("🔥 *Подбросил полешко в костёр!* С такими иллюстрациями от *%s* у нас в чате всегда атмосфера лучшей таверны!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Уши на макушке, хвост трубой!* Береста приветствует истинный приключенческий дух от *%s*!", speakerName),
-		fmt.Sprintf("📜 *Записал в протокол:* «*%s* выразил боевой настрой отряда языком древних пиктограмм».", speakerName),
-		fmt.Sprintf("🍻 *Поднимаю кружку виртуального эля за стикер от %s!* В самое яблочко!", speakerName),
-		fmt.Sprintf("🧙‍♂️ *Задумчиво погладил ус, глядя на рисунок %s.* Чувствую, в этой картинке скрыт глубокий тактический замысел!", speakerName),
-		fmt.Sprintf("🐾 *Топ-топ лапками по карте мира...* Прибежал полюбоваться на стикер от *%s*. Годно, очень годно!", speakerName),
-		fmt.Sprintf("🎨 *Художники королевского двора обзавидовались бы, %s!* Выписываю премию в виде внеочередного «Мяу одобрения»!", speakerName),
-		fmt.Sprintf("⚔️ *Звон мечей, треск факелов и этот стикер от %s* — вот ради чего мы все здесь и собрались!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Потёрся щекой о стикер %s.* Люблю, когда в чате пахнет настоящими приключениями!", speakerName),
-		fmt.Sprintf("🔮 *Поглядел на картинку %s сквозь граненый d20...* Похоже, сегодня нас ждёт весёлая сессия!", speakerName),
-		fmt.Sprintf("📚 *Положил стикер %s на самую почётную полку архива* — рядом с картой сокровищ и рецептом эля!", speakerName),
-		fmt.Sprintf("😏 *%s*, у тебя на каждый критический провал и великий триумф свой рисунок припасён?", speakerName),
-		fmt.Sprintf("🦉 *Мудрая сова в углу архива одобрительно ухнула на стикер %s!* В точку!", speakerName),
-		fmt.Sprintf("🐾 *Прошёл мягкими лапками по краю стикера %s* — оставил свои следы на память!", speakerName),
-		fmt.Sprintf("🎪 *Ну всё, %s, с таким стикером можно смело открывать передвижной театр в Ростланде!*", speakerName),
-		fmt.Sprintf("🕯️ *При свете свечи этот стикер от %s выглядит ещё эпичнее!* Заношу в анналы!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Выглянул из сундука с трофеями на шум от %s:* Ого, да тут целая картина маслом!", speakerName),
-		fmt.Sprintf("🗡️ *Даже старый клинок в ножнах зазвенел от такого стикера, %s!*", speakerName),
-		fmt.Sprintf("📖 *Закладку в хронике поставил прямо на этом шедевре от %s!* Непотеряемая классика.", speakerName),
-		fmt.Sprintf("🐾 *Привстал на задние лапки, разглядывая стикер %s.* Вот это уровень отыгрыша!", speakerName),
-		fmt.Sprintf("🌟 *Блестяще, %s!* Такой стикер добавляет +2 к морали всего отряда до конца дня!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Мяу! Посмотрел на стикер %s и сразу вспомнил наши лучшие походы по Украденным землям!*", speakerName),
-		fmt.Sprintf("✒️ *Макнул перо в золотые чернила:* Надо бы описать этот шедевр от *%s* в следующей главе!", speakerName),
-		fmt.Sprintf("🎲 *Если бы за стикеры кидали инициативу, %s только что выкинул натуральную двадцатку!*", speakerName),
-		fmt.Sprintf("🏕️ *У нашего походного костра стало ещё уютнее благодаря картинке от %s!*", speakerName),
-		fmt.Sprintf("😼 *Хм-м-м, %s...* Этот стикер подозрительно точно описывает текущее состояние нашей партии!", speakerName),
-		fmt.Sprintf("🐾 *Пошевелил чёрными ушами:* Одобряю вкус *%s* в наскальной живописи!", speakerName),
-		fmt.Sprintf("📜 *Свитки зашуршали от восторга, глядя на стикер %s!* Продолжайте в том же духе!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Сверкнул жёлтыми глазами из-за ширмы:* О-о-о, тяжёлая артиллерия стикеров от *%s* пошла в ход!", speakerName),
-		fmt.Sprintf("🛡️ *С таким боевым настроем от %s нам ни один дракон не страшен!*", speakerName),
-		fmt.Sprintf("🍯 *За такой душевный стикер, %s, коту-летописцу полагается двойная порция сметаны!*", speakerName),
-		fmt.Sprintf("👀 *Смотрю в оба глаза на художество %s* — ни одна деталь мимо архивариуса не проскочит!", speakerName),
-		fmt.Sprintf("🎶 *В трактирах столицы скоро будут петь баллады об этом стикере от %s!*", speakerName),
-		fmt.Sprintf("🐾 *Мягко прыгнул на стол поближе к стикеру %s.* Красота да и только!", speakerName),
-		fmt.Sprintf("🧭 *Компас приключений указывает прямо на %s!* Отличный выбор иллюстрации!", speakerName),
-		fmt.Sprintf("🐈‍⬛ *Мур-р-р!* Люблю, когда герои общаются на языке настоящих настольщиков, *%s*!", speakerName),
-		fmt.Sprintf("🏆 *Вручаю %s почётный кубок «Мастер иллюстраций текущего привала»!*", speakerName),
-	}
-
-	reply := replies[rand.Intn(len(replies))]
-	return c.Reply(reply, tele.ModeMarkdown)
+	return c.Reply(buildStickerReply(speakerName), tele.ModeMarkdown)
 }
 
 // handleTrackPollCommand позволяет админу подцепить уже существующий опрос ответом (reply) на него
@@ -2958,4 +2927,345 @@ func extractBerestaSummonTarget(text string) (string, bool) {
 		return "", false
 	}
 	return target, true
+}
+
+var berestaCompendiumTriggerRegex = regexp.MustCompile(`(?i)(?:заклинан[иеяю]|фокус|черт[ауеы]|действи[еяю]|народ|родословн[аяую]|происхожден[иея]|класс|спутник|фамильяр|покажи|найди|описани[ея]|что за|что такое|расскажи про|подскажи про|про)\s+(.+)$`)
+
+func extractBerestaCompendiumQuery(text string) (query string, kind string, ok bool) {
+	lower := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
+	switch {
+	case containsAny(lower, "заклинан", "фокус", "наговор"):
+		kind = "spell"
+	case containsAny(lower, "черт"):
+		kind = "feat"
+	case containsAny(lower, "действи"):
+		kind = "action"
+	case containsAny(lower, "происхожден"):
+		kind = "background"
+	case containsAny(lower, "родословн"):
+		kind = "heritage"
+	case containsAny(lower, "народ"):
+		kind = "ancestry"
+	case containsAny(lower, "спутник", "фамильяр", "верный звер"):
+		kind = "companion"
+	default:
+		kind = "all"
+	}
+
+	clean := strings.TrimSpace(strings.TrimRight(text, "?!."))
+	m := berestaCompendiumTriggerRegex.FindStringSubmatch(clean)
+	if len(m) < 2 {
+		return "", "", false
+	}
+	q := strings.TrimSpace(m[1])
+	if len([]rune(q)) < 3 {
+		return "", "", false
+	}
+	return q, kind, true
+}
+
+func formatCompendiumCardHTML(e catalog.CompendiumEntry) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("<b>%s</b>\n", html.EscapeString(e.Name)))
+
+	var metaParts []string
+	if e.Category != "" {
+		metaParts = append(metaParts, html.EscapeString(e.Category))
+	}
+	if e.Level > 0 && e.Kind != "spell" {
+		metaParts = append(metaParts, fmt.Sprintf("Ур. %d", e.Level))
+	}
+	if e.Actions != "" {
+		metaParts = append(metaParts, html.EscapeString(e.Actions))
+	}
+	if len(metaParts) > 0 {
+		sb.WriteString(fmt.Sprintf("<i>%s</i>\n", strings.Join(metaParts, " • ")))
+	}
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+
+	if len(e.Traditions) > 0 {
+		sb.WriteString(fmt.Sprintf("🔮 <b>Традиции:</b> %s\n", html.EscapeString(strings.Join(e.Traditions, ", "))))
+	}
+	if e.Traits != "" {
+		sb.WriteString(fmt.Sprintf("🏷️ <b>Дескрипторы:</b> <i>%s</i>\n", html.EscapeString(e.Traits)))
+	}
+	if e.Prerequisites != "" {
+		sb.WriteString(fmt.Sprintf("📋 <b>Требования:</b> %s\n", html.EscapeString(e.Prerequisites)))
+	}
+	if e.Meta != "" {
+		sb.WriteString(fmt.Sprintf("📌 %s\n", html.EscapeString(e.Meta)))
+	}
+	if e.Desc != "" {
+		sb.WriteString(fmt.Sprintf("\n📖 %s", html.EscapeString(e.Desc)))
+	}
+	if e.Source != "" {
+		sb.WriteString(fmt.Sprintf("\n\n<i>Источник: %s</i>", html.EscapeString(e.Source)))
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func (h *BotHandler) sendCompendiumLookup(c tele.Context, query, kind, emptyHint string) error {
+	if h.compendium == nil || h.compendium.Count() == 0 {
+		return c.Send("⚠️ Справочник PF2e временно недоступен.")
+	}
+	if query == "" {
+		return c.Send(emptyHint, tele.ModeHTML)
+	}
+
+	matches := h.compendium.Search(query, kind)
+	if len(matches) == 0 {
+		return c.Send(fmt.Sprintf("🔍 По запросу «<b>%s</b>» ничего не найдено.", html.EscapeString(query)), tele.ModeHTML)
+	}
+
+	if len(matches) == 1 {
+		return c.Send(formatCompendiumCardHTML(matches[0]), tele.ModeHTML)
+	}
+
+	if len(matches) > 8 {
+		matches = matches[:8]
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, it := range matches {
+		rows = append(rows, inline.Row(inline.Data(fmt.Sprintf("%s (%s)", it.Name, it.Category), "comp_view", it.ID)))
+	}
+	inline.Inline(rows...)
+
+	return c.Send(
+		fmt.Sprintf("📚 <b>Найдено несколько записей по запросу «%s»:</b>", html.EscapeString(query)),
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleCompendiumCommand(c tele.Context) error {
+	return h.sendCompendiumLookup(
+		c,
+		strings.TrimSpace(c.Message().Payload),
+		"all",
+		"📚 <b>Единый справочник PF2e</b>\n━━━━━━━━━━━━━━━━━━━━\nИщите заклинания, черты, действия, народы, классы и спутников:\n<code>/pf огненный шар</code> • <code>/pf медицина в бою</code> • <code>/pf стойка тигра</code>",
+	)
+}
+
+func (h *BotHandler) handleSpellLookupCommand(c tele.Context) error {
+	return h.sendCompendiumLookup(
+		c,
+		strings.TrimSpace(c.Message().Payload),
+		"spell",
+		"✨ <b>Справочник заклинаний и фокусов</b>\nПример: <code>/spell исцеление</code> • <code>/spell электрическая дуга</code>",
+	)
+}
+
+func (h *BotHandler) handleFeatLookupCommand(c tele.Context) error {
+	return h.sendCompendiumLookup(
+		c,
+		strings.TrimSpace(c.Message().Payload),
+		"feat",
+		"🏅 <b>Справочник черт</b>\nПример: <code>/feat крепкий орешек</code> • <code>/feat внезапный натиск</code>",
+	)
+}
+
+func (h *BotHandler) handleActionLookupCommand(c tele.Context) error {
+	return h.sendCompendiumLookup(
+		c,
+		strings.TrimSpace(c.Message().Payload),
+		"action",
+		"⚔️ <b>Справочник действий</b>\nПример: <code>/action деморализация</code> • <code>/action сбивание с ног</code>",
+	)
+}
+
+func (h *BotHandler) handleCompendiumViewCallback(c tele.Context) error {
+	_ = c.Respond()
+	if h.compendium == nil {
+		return c.Edit("⚠️ Справочник недоступен.")
+	}
+
+	parts := strings.Split(strings.TrimSpace(c.Callback().Data), "|")
+	entryID := parts[0]
+	entry, ok := h.compendium.FindByID(entryID)
+	if !ok {
+		return c.Edit("⚠️ Запись не найдена в справочнике.")
+	}
+
+	inline := &tele.ReplyMarkup{}
+	if len(parts) >= 3 {
+		inline.Inline(inline.Row(
+			inline.Data("⬅️ К списку", "comp_cat", fmt.Sprintf("%s|%s", parts[1], parts[2])),
+			inline.Data("📚 В справочник", "comp_home", "0"),
+		))
+	} else {
+		inline.Inline(inline.Row(
+			inline.Data("🔍 Новый поиск", "comp_find", "1"),
+			inline.Data("📚 В справочник", "comp_home", "0"),
+		))
+	}
+
+	return c.Edit(formatCompendiumCardHTML(entry), inline, tele.ModeHTML)
+}
+
+func (h *BotHandler) buildCompendiumHomeView() (string, *tele.ReplyMarkup) {
+	total := 0
+	if h.compendium != nil {
+		total = h.compendium.Count()
+	}
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(
+		inline.Row(inline.Data("🔍 Поиск по названию или описанию", "comp_find", "1")),
+		inline.Row(
+			inline.Data("✨ Заклинания и фокусы", "comp_cat", "spell|0"),
+			inline.Data("🏅 Черты", "comp_cat", "feat|0"),
+		),
+		inline.Row(
+			inline.Data("⚔️ Действия", "comp_cat", "action|0"),
+			inline.Data("🧬 Народы и родословные", "comp_cat", "ancestry|0"),
+		),
+		inline.Row(
+			inline.Data("🛡️ Классы", "comp_cat", "class|0"),
+			inline.Data("📜 Происхождения", "comp_cat", "background|0"),
+		),
+		inline.Row(
+			inline.Data("🌿 Родословные", "comp_cat", "heritage|0"),
+			inline.Data("🐾 Звери и фамильяры", "comp_cat", "companion|0"),
+		),
+		inline.Row(inline.Data("📖 Правила и состояния (/rule)", "rule_cat", "home|0")),
+		inline.Row(inline.Data("✖ Закрыть справочник", "tr_cancel", "0")),
+	)
+
+	text := fmt.Sprintf(
+		"📚 <b>Единый справочник Pathfinder 2e</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"📦 <b>Записей в базе:</b> <code>%d</code>\n"+
+			"💡 <i>Быстрые команды:</i> <code>/pf</code>, <code>/spell</code>, <code>/feat</code>, <code>/action</code>\n\n"+
+			"<i>Выберите раздел или нажмите «Поиск»:</i>",
+		total,
+	)
+	return text, inline
+}
+
+func (h *BotHandler) handleCompendiumMenu(c tele.Context) error {
+	tgID := c.Sender().ID
+	h.pendingPays.Delete(tgID)
+	h.pendingShopSearches.Delete(tgID)
+	h.pendingCompendiumSearches.Delete(tgID)
+
+	if h.compendium == nil || h.compendium.Count() == 0 {
+		return c.Send("⚠️ Справочник PF2e временно недоступен.", h.menuFor(tgID))
+	}
+
+	text, markup := h.buildCompendiumHomeView()
+	return c.Send(text, markup, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleCompendiumHomeCallback(c tele.Context) error {
+	_ = c.Respond()
+	h.pendingCompendiumSearches.Delete(c.Sender().ID)
+	text, markup := h.buildCompendiumHomeView()
+	return c.Edit(text, markup, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleCompendiumSearchPrompt(c tele.Context) error {
+	_ = c.Respond()
+	h.pendingCompendiumSearches.Store(c.Sender().ID, true)
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(inline.Row(inline.Data("⬅️ Назад в справочник", "comp_home", "0")))
+	return c.Edit(
+		"🔍 <b>Поиск по справочнику PF2e</b>\n\n"+
+			"Напишите название заклинания, черты, действия, народа или спутника в чат (например: <code>огненный шар</code>, <code>медицина в бою</code>, <code>стойка тигра</code>, <code>леший</code>):",
+		inline,
+		tele.ModeHTML,
+	)
+}
+
+func (h *BotHandler) handleCompendiumCategoryCallback(c tele.Context) error {
+	_ = c.Respond()
+	if h.compendium == nil {
+		return c.Edit("⚠️ Справочник недоступен.")
+	}
+
+	kind, pageStr, ok := strings.Cut(c.Callback().Data, "|")
+	if !ok {
+		return c.Edit("❌ Ошибка навигации.")
+	}
+	page, _ := strconv.Atoi(pageStr)
+	if page < 0 {
+		page = 0
+	}
+
+	entries := h.compendium.ByKind(kind)
+	if len(entries) == 0 {
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(inline.Row(inline.Data("⬅️ В справочник", "comp_home", "0")))
+		return c.Edit("⚠️ В этом разделе пока нет записей.", inline)
+	}
+
+	const pageSize = 8
+	totalPages := (len(entries) + pageSize - 1) / pageSize
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+
+	start := page * pageSize
+	end := start + pageSize
+	if end > len(entries) {
+		end = len(entries)
+	}
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for _, it := range entries[start:end] {
+		label := it.Name
+		if it.Kind == "feat" && it.Level > 0 {
+			label = fmt.Sprintf("%s (%d ур.)", it.Name, it.Level)
+		} else if it.Kind == "spell" {
+			if it.Level == 0 {
+				label = fmt.Sprintf("%s (фокус)", it.Name)
+			} else {
+				label = fmt.Sprintf("%s (%d кр.)", it.Name, it.Level)
+			}
+		}
+		rows = append(rows, inline.Row(inline.Data(label, "comp_view", fmt.Sprintf("%s|%s|%d", it.ID, kind, page))))
+	}
+
+	var navBtns []tele.Btn
+	if page > 0 {
+		navBtns = append(navBtns, inline.Data("⬅️ Назад", "comp_cat", fmt.Sprintf("%s|%d", kind, page-1)))
+	}
+	if page+1 < totalPages {
+		navBtns = append(navBtns, inline.Data("Вперёд ➡️", "comp_cat", fmt.Sprintf("%s|%d", kind, page+1)))
+	}
+	if len(navBtns) > 0 {
+		rows = append(rows, inline.Row(navBtns...))
+	}
+
+	rows = append(rows, inline.Row(
+		inline.Data("🔍 Поиск", "comp_find", "1"),
+		inline.Data("📚 К разделам", "comp_home", "0"),
+	))
+	inline.Inline(rows...)
+
+	catTitles := map[string]string{
+		"spell":      "✨ Заклинания и фокусы",
+		"feat":       "🏅 Черты (общие, навыков, классовые)",
+		"action":     "⚔️ Действия",
+		"ancestry":   "🧬 Народы",
+		"class":      "🛡️ Классы",
+		"background": "📜 Происхождения",
+		"heritage":   "🌿 Родословные",
+		"companion":  "🐾 Верные звери и фамильяры",
+	}
+	title := catTitles[kind]
+	if title == "" {
+		title = "📚 Справочник"
+	}
+
+	return c.Edit(
+		fmt.Sprintf("<b>%s</b> (стр. %d из %d • всего %d)\n<i>Нажмите на запись, чтобы открыть описание:</i>", title, page+1, totalPages, len(entries)),
+		inline,
+		tele.ModeHTML,
+	)
 }
