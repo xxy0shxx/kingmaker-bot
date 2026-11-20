@@ -106,6 +106,11 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle(&tele.Btn{Unique: "rule_cat"}, h.handleRuleCategoryCallback)
 	b.Handle(&tele.Btn{Unique: "rule_view"}, h.handleRuleViewCallback)
 
+	b.Handle("/quests", h.handleQuestsCommand)
+
+	b.Handle("/summary", h.handleSessionSummary)
+	b.Handle(&tele.Btn{Unique: "sum_pub"}, h.handlePublishSummaryCallback)
+
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
@@ -522,6 +527,10 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 				inline.Inline(rows...)
 				return c.Reply(fmt.Sprintf("📖 <b>Нашёл несколько правил по запросу «%s»:</b>", html.EscapeString(ruleQuery)), inline, tele.ModeHTML)
 			}
+		}
+
+		if replyText, handled := h.tryAnswerBerestaRoomQuery(context.Background(), c, text); handled {
+			return c.Reply(replyText, tele.ModeHTML)
 		}
 
 		chatID := c.Chat().ID
@@ -2599,4 +2608,245 @@ func (h *BotHandler) handleRuleViewCallback(c tele.Context) error {
 		inline,
 		tele.ModeHTML,
 	)
+}
+
+func (h *BotHandler) tryAnswerBerestaRoomQuery(ctx context.Context, c tele.Context, text string) (string, bool) {
+	lower := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
+
+	isTreasury := containsAny(lower, "казн", "общак", "сколько денег", "сколько золота", "бюджет")
+	isShop := containsAny(lower, "лавк", "магазин", "торгов", "купить")
+	isLocation := containsAny(lower, "где мы", "наш гекс", "локац", "местност", "погод", "карт")
+	isWounded := containsAny(lower, "кто ранен", "здоров", "пз отряда", "хит", "лечить кого", "состояние отряда")
+	isRich := containsAny(lower, "самый богатый", "у кого больше золота", "у кого деньги", "кошел")
+	isQuests := containsAny(lower, "квест", "задан", "слух", "зацепк", "поручен", "мисси", "что делать", "куда дальше")
+
+	if !isTreasury && !isShop && !isLocation && !isWounded && !isRich && !isQuests {
+		return "", false
+	}
+
+	sit, err := h.repo.GetRoomSituation(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+	if err != nil {
+		return fmt.Sprintf("🪶 Посмотрел в архив, но %s.", html.EscapeString(err.Error())), true
+	}
+
+	switch {
+	case isQuests:
+		return h.formatRoomQuestsAndRumors(ctx, c), true
+
+	case isTreasury:
+		totalGoldEq := float64(sit.TreasuryGold*100+sit.TreasurySilv*10+sit.TreasuryCopp) / 100.0
+		return fmt.Sprintf(
+			"💰 <b>Сверил гроссбух общей казны:</b>\nСейчас в сундуке отряда: <code>%d ЗМ • %d СМ • %d ММ</code> (всего ≈ <b>%.2f ЗМ</b>).",
+			sit.TreasuryGold, sit.TreasurySilv, sit.TreasuryCopp, totalGoldEq,
+		), true
+
+	case isShop:
+		if sit.ShopMaxLevel <= 0 {
+			return "🔒 <b>Лавка сейчас закрыта Мастером.</b>\nТорговля недоступна, пока отряд не доберётся до поселения или торговца.", true
+		}
+		return fmt.Sprintf(
+			"🏪 <b>Лавка открыта!</b>\nСейчас доступны обычные товары до <b>%d-го уровня</b> включительно. Открывайте <code>/shop</code> или загляните в рюкзак на веб-листе!",
+			sit.ShopMaxLevel,
+		), true
+
+	case isLocation:
+		loc := sit.HexCoord
+		if loc == "" {
+			loc = "не отмечен на карте"
+		}
+		if sit.HexTitle != "" {
+			loc = fmt.Sprintf("%s (%s)", html.EscapeString(sit.HexTitle), html.EscapeString(sit.HexCoord))
+		}
+		weatherLine := ""
+		if sit.Weather != "" {
+			weatherLine = fmt.Sprintf("\n🌤️ <b>Погода:</b> %s", html.EscapeString(sit.Weather))
+		}
+		terrainLine := ""
+		if sit.HexTerrain != "" {
+			terrainLine = fmt.Sprintf("\n🌲 <b>Местность:</b> %s", html.EscapeString(sit.HexTerrain))
+		}
+		return fmt.Sprintf("🗺️ <b>Сверяюсь с походной картой:</b>\nОтряд сейчас в точке: <b>%s</b>%s%s", loc, terrainLine, weatherLine), true
+
+	case isWounded:
+		if len(sit.Heroes) == 0 {
+			return "🛡️ В этой кампании пока не зарегистрированы герои.", true
+		}
+		var lines []string
+		for _, hb := range sit.Heroes {
+			icon := "💚"
+			if hb.MaxHP > 0 && hb.CurHP < hb.MaxHP {
+				icon = "🩸"
+			}
+			if hb.CurHP <= 0 {
+				icon = "💀"
+			}
+			lines = append(lines, fmt.Sprintf("%s <b>%s</b> (%d ур.): <code>%d / %d ПЗ</code>", icon, html.EscapeString(hb.Name), hb.Level, hb.CurHP, hb.MaxHP))
+		}
+		return "🩺 <b>Сводка по здоровью отряда:</b>\n" + strings.Join(lines, "\n"), true
+
+	case isRich:
+		if len(sit.Heroes) == 0 {
+			return "💰 Героев в отряде пока не найдено.", true
+		}
+		var lines []string
+		for _, hb := range sit.Heroes {
+			g := hb.TotalCp / 100
+			s := (hb.TotalCp % 100) / 10
+			cp := hb.TotalCp % 10
+			lines = append(lines, fmt.Sprintf("• <b>%s:</b> <code>%d ЗМ %d СМ %d ММ</code>", html.EscapeString(hb.Name), g, s, cp))
+		}
+		return "🪙 <b>Личные кошельки героев:</b>\n" + strings.Join(lines, "\n"), true
+	}
+
+	return "", false
+}
+
+// --- Активные квесты и слухи отряда ---
+
+func (h *BotHandler) handleQuestsCommand(c tele.Context) error {
+	msg := h.formatRoomQuestsAndRumors(context.Background(), c)
+	return c.Send(msg, tele.ModeHTML)
+}
+
+func (h *BotHandler) formatRoomQuestsAndRumors(ctx context.Context, c tele.Context) string {
+	leads, err := h.repo.GetRoomQuestsAndRumors(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+	if err != nil {
+		return fmt.Sprintf("🪶 Посмотрел в походный журнал, но %s.", html.EscapeString(err.Error()))
+	}
+
+	if len(leads.ActiveQuests) == 0 && len(leads.Rumors) == 0 && len(leads.CompletedQuests) == 0 {
+		return "📜 <b>Походный журнал пока чист:</b>\nНа карте ещё не отмечено ни одного задания или слуха."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📜 <b>Хроника заданий и слухов отряда</b>\n━━━━━━━━━━━━━━━━━━━━\n")
+
+	if len(leads.ActiveQuests) > 0 {
+		sb.WriteString("⚔️ <b>Активные задания:</b>\n")
+		for _, q := range leads.ActiveQuests {
+			loc := q.HexCoord
+			if q.HexTitle != "" {
+				loc = fmt.Sprintf("%s (%s)", html.EscapeString(q.HexTitle), html.EscapeString(q.HexCoord))
+			}
+			sb.WriteString(fmt.Sprintf("• <b>%s</b> — гекс <code>%s</code>\n", html.EscapeString(q.Title), loc))
+			if q.Desc != "" {
+				sb.WriteString(fmt.Sprintf("  <i>%s</i>\n", html.EscapeString(q.Desc)))
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(leads.Rumors) > 0 {
+		sb.WriteString("🗣️ <b>Услышанные слухи и зацепки:</b>\n")
+		for _, r := range leads.Rumors {
+			loc := r.HexCoord
+			if r.HexTitle != "" {
+				loc = fmt.Sprintf("%s (%s)", html.EscapeString(r.HexTitle), html.EscapeString(r.HexCoord))
+			}
+			sb.WriteString(fmt.Sprintf("📍 <b>Гекс %s:</b>\n%s\n", loc, html.EscapeString(r.Text)))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(leads.CompletedQuests) > 0 {
+		sb.WriteString(fmt.Sprintf("✅ <b>Выполнено заданий:</b> <code>%d</code>", len(leads.CompletedQuests)))
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+// --- Итоги сессии / Хроника дня (только для Мастера) ---
+
+func formatSessionSummaryHTML(sum *repository.SessionSummaryData) string {
+	var sb strings.Builder
+	sb.WriteString("📜 <b>Хроника дня: итоги игровой сессии</b>\n")
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+
+	if sum.WeatherLine != "" {
+		sb.WriteString(fmt.Sprintf("📅 <b>Календарь и погода:</b> %s\n", html.EscapeString(sum.WeatherLine)))
+	}
+
+	loc := sum.HexCoord
+	if loc == "" {
+		loc = "не отмечена"
+	}
+	if sum.HexTitle != "" {
+		loc = fmt.Sprintf("%s (%s)", html.EscapeString(sum.HexTitle), html.EscapeString(sum.HexCoord))
+	}
+	if sum.HexTerrain != "" {
+		loc += fmt.Sprintf(" — %s", html.EscapeString(sum.HexTerrain))
+	}
+	sb.WriteString(fmt.Sprintf("🗺️ <b>Стоянка отряда:</b> %s\n", loc))
+	sb.WriteString(fmt.Sprintf("💰 <b>Общая казна:</b> <code>%d ЗМ • %d СМ • %d ММ</code>\n", sum.TreasuryGold, sum.TreasurySilv, sum.TreasuryCopp))
+	sb.WriteString(fmt.Sprintf("🧭 <b>Журнал зацепок:</b> активных заданий — <code>%d</code>, слухов — <code>%d</code>\n\n", sum.ActiveQuests, sum.RumorsCount))
+
+	if len(sum.Heroes) > 0 {
+		sb.WriteString("🛡️ <b>Состав и состояние отряда:</b>\n")
+		for _, hb := range sum.Heroes {
+			icon := "💚"
+			if hb.MaxHP > 0 && hb.CurHP < hb.MaxHP {
+				icon = "🩸"
+			}
+			if hb.CurHP <= 0 {
+				icon = "💀"
+			}
+			sb.WriteString(fmt.Sprintf("• %s <b>%s</b> (%d ур.): <code>%d/%d ПЗ</code> • <code>%d ЗМ</code>\n",
+				icon, html.EscapeString(hb.Name), hb.Level, hb.CurHP, hb.MaxHP, hb.TotalCp/100))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(sum.RecentLogs) > 0 {
+		sb.WriteString("🧾 <b>Последние события казны и снаряжения:</b>\n")
+		for _, line := range sum.RecentLogs {
+			sb.WriteString(fmt.Sprintf("• %s\n", html.EscapeString(line)))
+		}
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func (h *BotHandler) handleSessionSummary(c tele.Context) error {
+	if !IsAdmin(c.Sender().ID) {
+		return c.Send("⛔ Эта команда доступна только Мастерам кампании.")
+	}
+
+	isPriv := c.Chat().Type == tele.ChatPrivate
+	sum, err := h.repo.GetSessionSummary(context.Background(), c.Chat().ID, c.Sender().ID, isPriv)
+	if err != nil {
+		return c.Send(fmt.Sprintf("❌ Не удалось собрать итоги: %s", html.EscapeString(err.Error())), tele.ModeHTML)
+	}
+
+	text := formatSessionSummaryHTML(sum)
+
+	// Если вызвано в личке и к комнате привязан групповой чат — даём кнопку публикации в группу
+	if isPriv && sum.TelegramChatID != 0 {
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(
+			inline.Row(inline.Data("📢 Опубликовать в чат партии", "sum_pub", sum.RoomCode)),
+			inline.Row(inline.Data("✖ Закрыть превью", "tr_cancel", "0")),
+		)
+		return c.Send(text, inline, tele.ModeHTML)
+	}
+
+	return c.Send(text, tele.ModeHTML)
+}
+
+func (h *BotHandler) handlePublishSummaryCallback(c tele.Context) error {
+	_ = c.Respond()
+	if !IsAdmin(c.Sender().ID) {
+		return nil
+	}
+
+	sum, err := h.repo.GetSessionSummary(context.Background(), c.Chat().ID, c.Sender().ID, true)
+	if err != nil || sum.TelegramChatID == 0 {
+		return c.Edit("❌ Групповой чат партии не привязан.")
+	}
+
+	text := formatSessionSummaryHTML(sum)
+	if _, err := c.Bot().Send(&tele.Chat{ID: sum.TelegramChatID}, text, tele.ModeHTML); err != nil {
+		return c.Edit(fmt.Sprintf("❌ Ошибка отправки в групповой чат: %v", err))
+	}
+
+	return c.Edit("✅ <b>Хроника дня опубликована в групповой чат партии!</b>", tele.ModeHTML)
 }

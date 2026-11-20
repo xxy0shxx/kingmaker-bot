@@ -1036,3 +1036,435 @@ func appendRoomAuditLog(ctx context.Context, tx pgx.Tx, roomCode, text string) {
 		_, _ = tx.Exec(ctx, `UPDATE public.campaign_state SET map_data = $1::jsonb WHERE room_code = $2`, string(updated), roomCode)
 	}
 }
+
+type HeroBrief struct {
+	Name    string
+	Class   string
+	Level   int
+	CurHP   int
+	MaxHP   int
+	TotalCp int
+}
+
+type RoomSituation struct {
+	RoomCode     string
+	TreasuryGold int
+	TreasurySilv int
+	TreasuryCopp int
+	ShopMaxLevel int
+	HexCoord     string
+	HexTitle     string
+	HexTerrain   string
+	Weather      string
+	Heroes       []HeroBrief
+}
+
+// GetRoomSituation возвращает актуальную сводку по комнате для ответа Бересты (строго в пределах room_code)
+func (r *HeroRepository) GetRoomSituation(ctx context.Context, chatID, senderID int64, isPrivate bool) (*RoomSituation, error) {
+	var roomCode string
+	var rawMap []byte
+
+	if isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT cs.room_code, cs.map_data
+			FROM public.campaign_heroes ch
+			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
+			WHERE ch.telegram_user_id = $1
+			LIMIT 1
+		`, senderID).Scan(&roomCode, &rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("персонаж не привязан к кампании")
+		}
+	} else {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code, map_data
+			FROM public.campaign_state
+			WHERE telegram_chat_id = $1
+			LIMIT 1
+		`, chatID).Scan(&roomCode, &rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("этот чат не привязан к игровой комнате")
+		}
+	}
+
+	sit := &RoomSituation{RoomCode: roomCode}
+
+	terrainRu := map[string]string{
+		"plains":    "Равнины",
+		"forest":    "Лес",
+		"hills":     "Холмы",
+		"mountains": "Горы",
+		"swamp":     "Болота",
+		"water":     "Вода / Река",
+	}
+
+	weatherRu := map[string]string{
+		"clear_cold": "Ясно и прохладно",
+		"clear_warm": "Ясно и тепло",
+		"overcast":   "Пасмурно",
+		"rain":       "Дождь",
+		"storm":      "Гроза / Буря",
+		"snow":       "Снегопад",
+		"fog":        "Туман",
+	}
+
+	var mapData map[string]any
+	if err := json.Unmarshal(rawMap, &mapData); err == nil {
+		// 1. Казна и магазин
+		if bst, ok := mapData["bestiary"].(map[string]any); ok {
+			if lvl, ok := bst["shopMaxLevel"].(float64); ok {
+				sit.ShopMaxLevel = int(lvl)
+			} else if open, ok := bst["isShopOpen"].(bool); ok && open {
+				sit.ShopMaxLevel = 2
+			}
+			if tr, ok := bst["treasury"].(map[string]any); ok {
+				sit.TreasuryGold = domain.GetInt(tr, "gold", 0)
+				sit.TreasurySilv = domain.GetInt(tr, "silver", 0)
+				sit.TreasuryCopp = domain.GetInt(tr, "copper", 0)
+			}
+		}
+
+		// 2. Погода (mapData.weather) и позиция отряда (mapData.hexes -> squadHere: true)
+		if wObj, ok := mapData["weather"].(map[string]any); ok && wObj != nil {
+			wID := domain.GetStr(wObj, "weatherId", "")
+			wLabel := weatherRu[wID]
+			if wLabel == "" {
+				wLabel = wID
+			}
+			day := domain.GetInt(wObj, "day", 0)
+			month := domain.GetInt(wObj, "month", 0)
+			year := domain.GetInt(wObj, "year", 0)
+			if day > 0 && month > 0 {
+				sit.Weather = fmt.Sprintf("%s (день %d, мес. %d, %d г.)", wLabel, day, month, year)
+			} else {
+				sit.Weather = wLabel
+			}
+		}
+
+		if hexes, ok := mapData["hexes"].(map[string]any); ok && hexes != nil {
+			for hKey, rawHex := range hexes {
+				hMap, ok := rawHex.(map[string]any)
+				if !ok || hMap == nil {
+					continue
+				}
+				if squadHere, ok := hMap["squadHere"].(bool); ok && squadHere {
+					sit.HexCoord = strings.TrimPrefix(hKey, "hex_")
+					sit.HexTitle = domain.GetStr(hMap, "title", domain.GetStr(hMap, "name", ""))
+					tRaw := domain.GetStr(hMap, "terrain", "")
+					if trName, exists := terrainRu[tRaw]; exists {
+						sit.HexTerrain = trName
+					} else {
+						sit.HexTerrain = tRaw
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// 3. Герои этой комнаты
+	rows, err := r.db.Query(ctx, `
+		SELECT hero_data FROM public.campaign_heroes WHERE room_code = $1 ORDER BY updated_at ASC
+	`, roomCode)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var rawH []byte
+			if rows.Scan(&rawH) != nil {
+				continue
+			}
+			var hData map[string]any
+			if json.Unmarshal(rawH, &hData) != nil {
+				continue
+			}
+			if inactive, ok := hData["inactive"].(bool); ok && inactive {
+				continue
+			}
+			st := ensureStatsMap(hData)
+			gp := domain.GetInt(st, "coinsGold", 0)
+			sp := domain.GetInt(st, "coinsSilver", 0)
+			cp := domain.GetInt(st, "coinsCopper", 0)
+
+			curHP := domain.GetInt(st, "hpCurrent", domain.GetInt(st, "hpCur", domain.GetInt(st, "hp", 0)))
+			maxHP := domain.GetInt(st, "hpMax", domain.GetInt(st, "hp", 0))
+
+			sit.Heroes = append(sit.Heroes, HeroBrief{
+				Name:    domain.GetStr(hData, "name", "Безымянный"),
+				Class:   domain.GetStr(st, "charClass", domain.GetStr(st, "class", "")),
+				Level:   domain.GetInt(st, "level", 1),
+				CurHP:   curHP,
+				MaxHP:   maxHP,
+				TotalCp: gp*100 + sp*10 + cp,
+			})
+		}
+	}
+
+	return sit, nil
+}
+
+type QuestBrief struct {
+	HexCoord string
+	HexTitle string
+	Title    string
+	Desc     string
+	Status   string
+}
+
+type RumorBrief struct {
+	HexCoord string
+	HexTitle string
+	Text     string
+}
+
+type RoomLeads struct {
+	ActiveQuests    []QuestBrief
+	CompletedQuests []QuestBrief
+	Rumors          []RumorBrief
+}
+
+// GetRoomQuestsAndRumors собирает все квесты и слухи с гексов конкретной комнаты
+func (r *HeroRepository) GetRoomQuestsAndRumors(ctx context.Context, chatID, senderID int64, isPrivate bool) (*RoomLeads, error) {
+	var rawMap []byte
+	if isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT cs.map_data
+			FROM public.campaign_heroes ch
+			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
+			WHERE ch.telegram_user_id = $1
+			LIMIT 1
+		`, senderID).Scan(&rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("персонаж не привязан к кампании")
+		}
+	} else {
+		err := r.db.QueryRow(ctx, `
+			SELECT map_data
+			FROM public.campaign_state
+			WHERE telegram_chat_id = $1
+			LIMIT 1
+		`, chatID).Scan(&rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("этот чат не привязан к игровой комнате")
+		}
+	}
+
+	var mapData map[string]any
+	if err := json.Unmarshal(rawMap, &mapData); err != nil {
+		return nil, err
+	}
+
+	leads := &RoomLeads{}
+	hexes, ok := mapData["hexes"].(map[string]any)
+	if !ok || hexes == nil {
+		return leads, nil
+	}
+
+	for hKey, rawHex := range hexes {
+		hMap, ok := rawHex.(map[string]any)
+		if !ok || hMap == nil {
+			continue
+		}
+		coord := strings.TrimPrefix(hKey, "hex_")
+		hTitle := strings.TrimSpace(domain.GetStr(hMap, "title", domain.GetStr(hMap, "name", "")))
+
+		// 1. Квест на гексе (questData)
+		if qData, ok := hMap["questData"].(map[string]any); ok && qData != nil {
+			qTitle := strings.TrimSpace(domain.GetStr(qData, "title", ""))
+			qDesc := strings.TrimSpace(domain.GetStr(qData, "description", domain.GetStr(qData, "desc", domain.GetStr(qData, "text", ""))))
+			qStatus := strings.TrimSpace(domain.GetStr(qData, "status", "active"))
+			if qTitle != "" {
+				item := QuestBrief{
+					HexCoord: coord,
+					HexTitle: hTitle,
+					Title:    qTitle,
+					Desc:     qDesc,
+					Status:   qStatus,
+				}
+				if qStatus == "completed" {
+					leads.CompletedQuests = append(leads.CompletedQuests, item)
+				} else {
+					leads.ActiveQuests = append(leads.ActiveQuests, item)
+				}
+			}
+		}
+
+		// 2. Слухи и зацепки на гексе (rumorText)
+		rumor := strings.TrimSpace(domain.GetStr(hMap, "rumorText", ""))
+		if rumor != "" {
+			leads.Rumors = append(leads.Rumors, RumorBrief{
+				HexCoord: coord,
+				HexTitle: hTitle,
+				Text:     rumor,
+			})
+		}
+	}
+
+	return leads, nil
+}
+
+type SessionSummaryData struct {
+	RoomCode       string
+	TelegramChatID int64
+	HexCoord       string
+	HexTitle       string
+	HexTerrain     string
+	WeatherLine    string
+	TreasuryGold   int
+	TreasurySilv   int
+	TreasuryCopp   int
+	RecentLogs     []string
+	ActiveQuests   int
+	RumorsCount    int
+	Heroes         []HeroBrief
+}
+
+// GetSessionSummary собирает сводку по кампании для итогов сессии Мастера
+func (r *HeroRepository) GetSessionSummary(ctx context.Context, chatID, senderID int64, isPrivate bool) (*SessionSummaryData, error) {
+	var roomCode string
+	var groupChatID int64
+	var rawMap []byte
+
+	if !isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code, COALESCE(telegram_chat_id, 0), map_data
+			FROM public.campaign_state
+			WHERE telegram_chat_id = $1
+			LIMIT 1
+		`, chatID).Scan(&roomCode, &groupChatID, &rawMap)
+		if err != nil {
+			return nil, fmt.Errorf("этот групповой чат не привязан к комнате")
+		}
+	} else {
+		// В личке ищем комнату по привязанному герою Мастера, либо первую комнату с активным чатом
+		err := r.db.QueryRow(ctx, `
+			SELECT cs.room_code, COALESCE(cs.telegram_chat_id, 0), cs.map_data
+			FROM public.campaign_heroes ch
+			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
+			WHERE ch.telegram_user_id = $1
+			LIMIT 1
+		`, senderID).Scan(&roomCode, &groupChatID, &rawMap)
+		if err != nil {
+			err = r.db.QueryRow(ctx, `
+				SELECT room_code, COALESCE(telegram_chat_id, 0), map_data
+				FROM public.campaign_state
+				WHERE telegram_chat_id IS NOT NULL AND telegram_chat_id <> 0
+				LIMIT 1
+			`).Scan(&roomCode, &groupChatID, &rawMap)
+			if err != nil {
+				return nil, fmt.Errorf("не найдена активная игровая комната")
+			}
+		}
+	}
+
+	sum := &SessionSummaryData{
+		RoomCode:       roomCode,
+		TelegramChatID: groupChatID,
+	}
+
+	terrainRu := map[string]string{
+		"plains": "Равнины", "forest": "Лес", "hills": "Холмы",
+		"mountains": "Горы", "swamp": "Болота", "water": "Вода / Река",
+	}
+	weatherRu := map[string]string{
+		"clear_cold": "Ясно и прохладно", "clear_warm": "Ясно и тепло",
+		"overcast": "Пасмурно", "rain": "Дождь", "storm": "Гроза / Буря",
+		"snow": "Снегопад", "fog": "Туман",
+	}
+
+	var mapData map[string]any
+	if err := json.Unmarshal(rawMap, &mapData); err == nil {
+		if bst, ok := mapData["bestiary"].(map[string]any); ok {
+			if tr, ok := bst["treasury"].(map[string]any); ok {
+				sum.TreasuryGold = domain.GetInt(tr, "gold", 0)
+				sum.TreasurySilv = domain.GetInt(tr, "silver", 0)
+				sum.TreasuryCopp = domain.GetInt(tr, "copper", 0)
+				if rawLogs, ok := tr["log"].([]any); ok {
+					for i, item := range rawLogs {
+						if i >= 8 {
+							break
+						}
+						if line, ok := item.(string); ok && strings.TrimSpace(line) != "" {
+							sum.RecentLogs = append(sum.RecentLogs, strings.TrimSpace(line))
+						}
+					}
+				}
+			}
+		}
+
+		if wObj, ok := mapData["weather"].(map[string]any); ok && wObj != nil {
+			wID := domain.GetStr(wObj, "weatherId", "")
+			wLabel := weatherRu[wID]
+			if wLabel == "" {
+				wLabel = wID
+			}
+			day := domain.GetInt(wObj, "day", 0)
+			month := domain.GetInt(wObj, "month", 0)
+			year := domain.GetInt(wObj, "year", 0)
+			if day > 0 && month > 0 {
+				sum.WeatherLine = fmt.Sprintf("День %d, мес. %d, %d г. • %s", day, month, year, wLabel)
+			} else {
+				sum.WeatherLine = wLabel
+			}
+		}
+
+		if hexes, ok := mapData["hexes"].(map[string]any); ok && hexes != nil {
+			for hKey, rawHex := range hexes {
+				hMap, ok := rawHex.(map[string]any)
+				if !ok || hMap == nil {
+					continue
+				}
+				if squadHere, ok := hMap["squadHere"].(bool); ok && squadHere {
+					sum.HexCoord = strings.TrimPrefix(hKey, "hex_")
+					sum.HexTitle = domain.GetStr(hMap, "title", domain.GetStr(hMap, "name", ""))
+					tRaw := domain.GetStr(hMap, "terrain", "")
+					if trName, exists := terrainRu[tRaw]; exists {
+						sum.HexTerrain = trName
+					} else {
+						sum.HexTerrain = tRaw
+					}
+				}
+				if qData, ok := hMap["questData"].(map[string]any); ok && qData != nil {
+					if domain.GetStr(qData, "status", "active") != "completed" && domain.GetStr(qData, "title", "") != "" {
+						sum.ActiveQuests++
+					}
+				}
+				if strings.TrimSpace(domain.GetStr(hMap, "rumorText", "")) != "" {
+					sum.RumorsCount++
+				}
+			}
+		}
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT hero_data FROM public.campaign_heroes WHERE room_code = $1 ORDER BY updated_at ASC
+	`, roomCode)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var rawH []byte
+			if rows.Scan(&rawH) != nil {
+				continue
+			}
+			var hData map[string]any
+			if json.Unmarshal(rawH, &hData) != nil {
+				continue
+			}
+			if inactive, ok := hData["inactive"].(bool); ok && inactive {
+				continue
+			}
+			st := ensureStatsMap(hData)
+			gp := domain.GetInt(st, "coinsGold", 0)
+			sp := domain.GetInt(st, "coinsSilver", 0)
+			cp := domain.GetInt(st, "coinsCopper", 0)
+			sum.Heroes = append(sum.Heroes, HeroBrief{
+				Name:    domain.GetStr(hData, "name", "Безымянный"),
+				Level:   domain.GetInt(st, "level", 1),
+				CurHP:   domain.GetInt(st, "hpCurrent", domain.GetInt(st, "hpCur", domain.GetInt(st, "hp", 0))),
+				MaxHP:   domain.GetInt(st, "hpMax", domain.GetInt(st, "hp", 0)),
+				TotalCp: gp*100 + sp*10 + cp,
+			})
+		}
+	}
+
+	return sum, nil
+}
