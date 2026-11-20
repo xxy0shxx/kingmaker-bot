@@ -1303,19 +1303,21 @@ func (r *HeroRepository) GetRoomQuestsAndRumors(ctx context.Context, chatID, sen
 }
 
 type SessionSummaryData struct {
-	RoomCode       string
-	TelegramChatID int64
-	HexCoord       string
-	HexTitle       string
-	HexTerrain     string
-	WeatherLine    string
-	TreasuryGold   int
-	TreasurySilv   int
-	TreasuryCopp   int
-	RecentLogs     []string
-	ActiveQuests   int
-	RumorsCount    int
-	Heroes         []HeroBrief
+	RoomCode        string
+	TelegramChatID  int64
+	HexCoord        string
+	HexTitle        string
+	HexTerrain      string
+	WeatherLine     string
+	TreasuryGold    int
+	TreasurySilv    int
+	TreasuryCopp    int
+	TreasuryNotes   string
+	RecentLogs      []string
+	ActiveQuests    int
+	CompletedQuests int
+	RumorsCount     int
+	Heroes          []HeroBrief
 }
 
 // GetSessionSummary собирает сводку по кампании для итогов сессии Мастера
@@ -1378,9 +1380,10 @@ func (r *HeroRepository) GetSessionSummary(ctx context.Context, chatID, senderID
 				sum.TreasuryGold = domain.GetInt(tr, "gold", 0)
 				sum.TreasurySilv = domain.GetInt(tr, "silver", 0)
 				sum.TreasuryCopp = domain.GetInt(tr, "copper", 0)
+				sum.TreasuryNotes = strings.TrimSpace(domain.GetStr(tr, "notes", ""))
 				if rawLogs, ok := tr["log"].([]any); ok {
 					for i, item := range rawLogs {
-						if i >= 8 {
+						if i >= 25 {
 							break
 						}
 						if line, ok := item.(string); ok && strings.TrimSpace(line) != "" {
@@ -1424,8 +1427,12 @@ func (r *HeroRepository) GetSessionSummary(ctx context.Context, chatID, senderID
 					}
 				}
 				if qData, ok := hMap["questData"].(map[string]any); ok && qData != nil {
-					if domain.GetStr(qData, "status", "active") != "completed" && domain.GetStr(qData, "title", "") != "" {
-						sum.ActiveQuests++
+					if domain.GetStr(qData, "title", "") != "" {
+						if domain.GetStr(qData, "status", "active") == "completed" {
+							sum.CompletedQuests++
+						} else {
+							sum.ActiveQuests++
+						}
 					}
 				}
 				if strings.TrimSpace(domain.GetStr(hMap, "rumorText", "")) != "" {
@@ -1458,6 +1465,7 @@ func (r *HeroRepository) GetSessionSummary(ctx context.Context, chatID, senderID
 			cp := domain.GetInt(st, "coinsCopper", 0)
 			sum.Heroes = append(sum.Heroes, HeroBrief{
 				Name:    domain.GetStr(hData, "name", "Безымянный"),
+				Class:   domain.GetStr(st, "charClass", domain.GetStr(st, "class", "")),
 				Level:   domain.GetInt(st, "level", 1),
 				CurHP:   domain.GetInt(st, "hpCurrent", domain.GetInt(st, "hpCur", domain.GetInt(st, "hp", 0))),
 				MaxHP:   domain.GetInt(st, "hpMax", domain.GetInt(st, "hp", 0)),
@@ -1736,4 +1744,49 @@ func (r *HeroRepository) MarkSessionReminderSent(ctx context.Context, roomCode, 
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// GetRoomActiveHeroes возвращает список активных персонажей комнаты для текущего чата или личных сообщений
+func (r *HeroRepository) GetRoomActiveHeroes(ctx context.Context, chatID, senderID int64, isPrivate bool) ([]domain.HeroRecord, error) {
+	var roomCode string
+	if isPrivate {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
+		`, senderID).Scan(&roomCode)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		err := r.db.QueryRow(ctx, `
+			SELECT room_code FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
+		`, chatID).Scan(&roomCode)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT id, room_code, is_readonly, hero_data
+		FROM public.campaign_heroes
+		WHERE room_code = $1
+	`, roomCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []domain.HeroRecord
+	for rows.Next() {
+		var rec domain.HeroRecord
+		var rawJSON []byte
+		if err := rows.Scan(&rec.ID, &rec.RoomCode, &rec.IsReadOnly, &rawJSON); err == nil {
+			if json.Unmarshal(rawJSON, &rec.Data) == nil {
+				if inactive, ok := rec.Data["inactive"].(bool); ok && inactive {
+					continue
+				}
+				list = append(list, rec)
+			}
+		}
+	}
+	return list, nil
 }

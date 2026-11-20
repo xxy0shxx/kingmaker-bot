@@ -564,6 +564,27 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 		return nil
 	}
 
+	if mentionedHero, found := h.findMentionedHero(context.Background(), c, text); found {
+		chatID := c.Chat().ID
+		if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
+			if time.Since(lastVal.(time.Time)) < 25*time.Second {
+				return nil
+			}
+		}
+		h.lastMentionReply.Store(chatID, time.Now())
+
+		speakerName := c.Sender().FirstName
+		if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+			speakerName = domain.GetStr(hero.Data, "name", speakerName)
+		}
+
+		reply := buildHeroMentionReply(text, speakerName, mentionedHero)
+		if err := c.Reply(reply, tele.ModeMarkdown); err != nil {
+			return c.Reply(strings.ReplaceAll(reply, "*", ""))
+		}
+		return nil
+	}
+
 	return nil
 }
 
@@ -2773,7 +2794,7 @@ func (h *BotHandler) formatRoomQuestsAndRumors(ctx context.Context, c tele.Conte
 
 func formatSessionSummaryHTML(sum *repository.SessionSummaryData) string {
 	var sb strings.Builder
-	sb.WriteString("📜 <b>Хроника дня: итоги игровой сессии</b>\n")
+	sb.WriteString("📜 <b>Хроника дня: подробные итоги игровой сессии</b>\n")
 	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 
 	if sum.WeatherLine != "" {
@@ -2791,11 +2812,20 @@ func formatSessionSummaryHTML(sum *repository.SessionSummaryData) string {
 		loc += fmt.Sprintf(" — %s", html.EscapeString(sum.HexTerrain))
 	}
 	sb.WriteString(fmt.Sprintf("🗺️ <b>Стоянка отряда:</b> %s\n", loc))
-	sb.WriteString(fmt.Sprintf("💰 <b>Общая казна:</b> <code>%d ЗМ • %d СМ • %d ММ</code>\n", sum.TreasuryGold, sum.TreasurySilv, sum.TreasuryCopp))
-	sb.WriteString(fmt.Sprintf("🧭 <b>Журнал зацепок:</b> активных заданий — <code>%d</code>, слухов — <code>%d</code>\n\n", sum.ActiveQuests, sum.RumorsCount))
+
+	totalGoldEq := float64(sum.TreasuryGold*100+sum.TreasurySilv*10+sum.TreasuryCopp) / 100.0
+	sb.WriteString(fmt.Sprintf("💰 <b>Общая казна:</b> <code>%d ЗМ • %d СМ • %d ММ</code> (≈ <b>%.2f ЗМ</b>)\n",
+		sum.TreasuryGold, sum.TreasurySilv, sum.TreasuryCopp, totalGoldEq))
+
+	if sum.TreasuryNotes != "" {
+		sb.WriteString(fmt.Sprintf("📌 <b>Заметки казначея:</b> <i>%s</i>\n", html.EscapeString(sum.TreasuryNotes)))
+	}
+
+	sb.WriteString(fmt.Sprintf("🧭 <b>Журнал зацепок:</b> активных — <code>%d</code> • выполнено — <code>%d</code> • слухов — <code>%d</code>\n\n",
+		sum.ActiveQuests, sum.CompletedQuests, sum.RumorsCount))
 
 	if len(sum.Heroes) > 0 {
-		sb.WriteString("🛡️ <b>Состав и состояние отряда:</b>\n")
+		sb.WriteString("🛡️ <b>Состав, здоровье и кошельки отряда:</b>\n")
 		for _, hb := range sum.Heroes {
 			icon := "💚"
 			if hb.MaxHP > 0 && hb.CurHP < hb.MaxHP {
@@ -2804,17 +2834,29 @@ func formatSessionSummaryHTML(sum *repository.SessionSummaryData) string {
 			if hb.CurHP <= 0 {
 				icon = "💀"
 			}
-			sb.WriteString(fmt.Sprintf("• %s <b>%s</b> (%d ур.): <code>%d/%d ПЗ</code> • <code>%d ЗМ</code>\n",
-				icon, html.EscapeString(hb.Name), hb.Level, hb.CurHP, hb.MaxHP, hb.TotalCp/100))
+
+			classLabel := ""
+			if hb.Class != "" {
+				classLabel = fmt.Sprintf(", %s", html.EscapeString(hb.Class))
+			}
+
+			g := hb.TotalCp / 100
+			s := (hb.TotalCp % 100) / 10
+			cp := hb.TotalCp % 10
+
+			sb.WriteString(fmt.Sprintf("• %s <b>%s</b> (%d ур.%s): <code>%d/%d ПЗ</code> • <code>%d ЗМ %d СМ %d ММ</code>\n",
+				icon, html.EscapeString(hb.Name), hb.Level, classLabel, hb.CurHP, hb.MaxHP, g, s, cp))
 		}
 		sb.WriteString("\n")
 	}
 
 	if len(sum.RecentLogs) > 0 {
-		sb.WriteString("🧾 <b>Последние события казны и снаряжения:</b>\n")
-		for _, line := range sum.RecentLogs {
-			sb.WriteString(fmt.Sprintf("• %s\n", html.EscapeString(line)))
+		sb.WriteString(fmt.Sprintf("🧾 <b>Летопись операций казны и снаряжения (последние %d):</b>\n", len(sum.RecentLogs)))
+		for i, line := range sum.RecentLogs {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, html.EscapeString(line)))
 		}
+	} else {
+		sb.WriteString("🧾 <b>Летопись операций:</b> <i>записей пока нет.</i>\n")
 	}
 
 	return strings.TrimSpace(sb.String())
@@ -3129,4 +3171,266 @@ func (h *BotHandler) handlePhotoMessage(c tele.Context) error {
 
 	reply := replies[rand.Intn(len(replies))]
 	return c.Reply(reply, tele.ModeMarkdown)
+}
+
+var ignoredNameWords = map[string]bool{
+	"из": true, "де": true, "фон": true, "ван": true, "дер": true, "ла": true, "ле": true,
+	"сэр": true, "леди": true, "лорд": true, "барон": true, "граф": true, "князь": true,
+	"мастер": true, "герой": true, "кот": true, "пёс": true, "пес": true, "волк": true,
+	"сын": true, "дочь": true, "младший": true, "старший": true, "великий": true,
+}
+
+func (h *BotHandler) findMentionedHero(ctx context.Context, c tele.Context, text string) (*domain.HeroRecord, bool) {
+	heroes, err := h.repo.GetRoomActiveHeroes(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+	if err != nil || len(heroes) == 0 {
+		return nil, false
+	}
+
+	lowerText := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
+	words := strings.FieldsFunc(lowerText, func(r rune) bool {
+		return !((r >= 'а' && r <= 'я') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-')
+	})
+
+	for i := range heroes {
+		fullName := strings.TrimSpace(domain.GetStr(heroes[i].Data, "name", ""))
+		if fullName == "" {
+			continue
+		}
+
+		nameParts := strings.Fields(strings.ToLower(strings.ReplaceAll(fullName, "ё", "е")))
+		for _, part := range nameParts {
+			part = strings.Trim(part, `"'«»().,!?-`)
+			if ignoredNameWords[part] {
+				continue
+			}
+
+			partRunes := []rune(part)
+			if len(partRunes) < 3 {
+				continue
+			}
+
+			// Для коротких имён (3-4 буквы) требуем точное совпадение слова
+			if len(partRunes) <= 4 {
+				for _, w := range words {
+					if w == part {
+						return &heroes[i], true
+					}
+				}
+				continue
+			}
+
+			// Для имён от 5 букв отсекаем 1 букву окончания для падежей
+			// и проверяем, что разница в длине не больше 3 букв (защита от случайных совпадений)
+			stem := string(partRunes[:len(partRunes)-1])
+			for _, w := range words {
+				wRunes := []rune(w)
+				if strings.HasPrefix(w, stem) && len(wRunes)-len(partRunes) <= 3 {
+					return &heroes[i], true
+				}
+			}
+		}
+	}
+
+	return nil, false
+}
+
+func buildHeroMentionReply(text, speaker string, target *domain.HeroRecord) string {
+	lower := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
+	heroName := domain.GetStr(target.Data, "name", "Герой")
+	st := target.Stats()
+
+	gp := domain.GetInt(st, "coinsGold", 0)
+	sp := domain.GetInt(st, "coinsSilver", 0)
+	cp := domain.GetInt(st, "coinsCopper", 0)
+	curHP := domain.GetInt(st, "hpCurrent", domain.GetInt(st, "hpCur", domain.GetInt(st, "hp", 0)))
+	maxHP := domain.GetInt(st, "hpMax", domain.GetInt(st, "hp", 0))
+
+	ac := domain.GetInt(st, "ac", 10)
+	armor := domain.GetStr(st, "armorName", domain.GetStr(st, "eq_armor_Name", "без доспеха"))
+	weapon := domain.GetStr(st, "eq_mainHand_Name", domain.GetStr(st, "melee1Name", "пустые руки"))
+	bagCount := 0
+	for i := 1; i <= 15; i++ {
+		if domain.GetStr(st, fmt.Sprintf("item%dName", i), "") != "" {
+			bagCount++
+		}
+	}
+
+	pick := func(list []string) string {
+		return list[rand.Intn(len(list))]
+	}
+
+	switch {
+	// 1. Золото, траты и кошелёк (30 вариантов)
+	case containsAny(lower, "зм", "золот", "монет", "деньг", "денег", "слил", "потрат", "кошел", "богат", "сколько у", "долг", "куп", "прод"):
+		return pick([]string{
+			fmt.Sprintf("🪙 *%s*, я заглянул в гроссбух! У героя *%s* сейчас в кошельке `%d ЗМ %d СМ %d ММ`. Остальное, видимо, ушло на кутёж и сомнительные артефакты!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("📜 По моим записям, *%s*, у *%s* осталось ровно `%d ЗМ %d СМ %d ММ`. Куда делось остальное — история умалчивает, но таверна в прошлый раз гудела знатно!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("👀 *%s*, уши навострил! Сверяю баланс *%s*: сейчас на руках `%d ЗМ %d СМ %d ММ`. Если что-то пропало — я тут ни при чём, у меня лапки!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("💰 Мяу-казначей на связи, *%s*! В карманах у *%s* звенит ровно `%d ЗМ %d СМ %d ММ`.", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🧮 Пощёлкал когтями на счётах, *%s*: у *%s* за душой `%d ЗМ %d СМ %d ММ`. На кружку эля точно хватит!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🐈‍⬛ Проверил кошель *%s* — там `%d ЗМ %d СМ %d ММ`. Остальное, наверное, унесли сороки или трактирщики!", heroName, gp, sp, cp),
+			fmt.Sprintf("⚖️ В расходной книге против имени *%s* значится остаток `%d ЗМ %d СМ %d ММ`. Всё сходится до медяка, *%s*!", heroName, gp, sp, cp, speaker),
+			fmt.Sprintf("🤑 О-о-о, считаем чужие монетки, *%s*? У *%s* сейчас припрятано `%d ЗМ %d СМ %d ММ`!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🔍 Обнюхал кошелёк *%s*: пахнет старой кожей и `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("💸 *%s*, не поверишь, но у *%s* в заначке ещё осталось `%d ЗМ %d СМ %d ММ`!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🏦 Архивный банк докладывает: текущий счёт *%s* составляет `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("😏 *%s*, если *%s* говорит, что на мели — не верь! У него в кармане `%d ЗМ %d СМ %d ММ`!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🪙 Дзынь-дзынь! Перетряхнул виртуальный кошель *%s* — выпало `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("📖 Открыл страницу финансов, *%s*: капитал *%s* на сегодня — `%d ЗМ %d СМ %d ММ`.", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🐾 Прошёл мягкими лапками мимо сундука *%s* и краем глаза заметил `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("🍻 На таверну хватит, на замок с драконами — пока нет: у *%s* ровно `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("🧾 *%s*, по последней инвентаризации *%s* располагает суммой `%d ЗМ %d СМ %d ММ`.", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("💎 Блеск монет приманил кота из-за ширмы! У *%s* в наличии `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("🕵️‍♂️ *%s*, мои усы не обманешь: у *%s* сейчас ровно `%d ЗМ %d СМ %d ММ`, ни медяком больше!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🪙 Если *%s* решит угостить весь отряд, у него на это есть `%d ЗМ %d СМ %d ММ`!", heroName, gp, sp, cp),
+			fmt.Sprintf("📉 Утечки бюджета не обнаружено, *%s*: в кошельке *%s* честно лежат `%d ЗМ %d СМ %d ММ`.", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🐈‍⬛ Мур-р-р, люблю звук золота! У *%s* его сейчас `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("🕯️ При свете свечи пересчитал монеты *%s*: получилось `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("💰 *%s*, докладываю без утайки: финансовая подушка *%s* равна `%d ЗМ %d СМ %d ММ`.", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🎒 Заглянул в потайной карман *%s* — там звенят `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("⚖️ Казначей одобряет: у *%s* порядок в монетах — `%d ЗМ %d СМ %d ММ` на руках.", heroName, gp, sp, cp),
+			fmt.Sprintf("🤫 По секрету всему чату, *%s*: у *%s* сейчас `%d ЗМ %d СМ %d ММ`!", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🪙 Суммирую золото, серебро и медь *%s*: итого `%d ЗМ %d СМ %d ММ`.", heroName, gp, sp, cp),
+			fmt.Sprintf("📜 Записано на бересте, *%s*: кошель *%s* содержит `%d ЗМ %d СМ %d ММ`.", speaker, heroName, gp, sp, cp),
+			fmt.Sprintf("🐾 Не переживай за бюджет *%s*, *%s* — в запасе есть `%d ЗМ %d СМ %d ММ`!", heroName, speaker, gp, sp, cp),
+		})
+
+	// 2. Здоровье, ранения и лечение (30 вариантов)
+	case containsAny(lower, "хп", "пз", "ранен", "здоров", "убил", "леч", "хил", "жив", "при смерт", "болит", "урон", "погиб"):
+		return pick([]string{
+			fmt.Sprintf("🩺 *%s*, докладываю по медицинской карте: у *%s* сейчас `%d / %d ПЗ`. Держим бинты наготове!", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🐾 Выглянул из-за ширмы при упоминании *%s*! Полоска здоровья показывает `%d из %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🩹 Проверил пульс и свиток здоровья *%s*: в наличии `%d / %d ПЗ`!", heroName, curHP, maxHP),
+			fmt.Sprintf("🐈‍⬛ Мяу-лекарь на посту, *%s*! У *%s* сейчас `%d из %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("💊 Заглянул в журнал лазарета: *%s* держится на отметке `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("❤️ *%s*, по моим подсчётам у *%s* осталось `%d / %d ПЗ` — некролог писать пока рано!", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🧪 Если кто-то ищет, кому налить целебного зелья, *%s*, то у *%s* сейчас `%d / %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🩺 Постучал лапкой по градуснику: состояние *%s* — `%d из %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("📜 В медицинской ведомости против *%s* записано: `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("👀 *%s*, глянул краем глаза в лист *%s*: здоровье составляет `%d / %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🩹 Бинты в сундуке ещё есть, а у *%s* сейчас `%d из %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🐈‍⬛ Помурчал на больное место *%s*! Текущий запас сил: `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("⚕️ Полевой госпиталь докладывает, *%s*: боец *%s* имеет `%d / %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🩸 Считаем царапины *%s*: в строю осталось `%d из %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🌿 Подорожник приложен, а счётчик *%s* показывает `%d / %d ПЗ`!", heroName, curHP, maxHP),
+			fmt.Sprintf("🕯️ Зажёг свечу за здравие *%s* — в запасе имеется `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🛡️ *%s*, передай лекарям, что у *%s* сейчас ровно `%d из %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🐾 Уши на макушке! Слежу за здоровьем *%s*: на данный момент `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("📋 Свежая сводка из лазарета, *%s*: у *%s* числится `%d / %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("💉 Аптечка наготове! У *%s* сейчас `%d из %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("😼 *%s*, у котов девять жизней, а у *%s* сейчас `%d / %d ПЗ`!", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("📖 Сверяюсь с хроникой боёв: *%s* располагает `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🩹 Ни одна рана не пройдёт мимо архива: у *%s* зафиксировано `%d из %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🍵 Горячий отвар не помешает, *%s*, ведь у *%s* сейчас `%d / %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🔍 Проверил на просвет свиток *%s* — полоска ПЗ равна `%d / %d`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🐾 Не волнуйся, *%s*, я присматриваю за *%s*: сейчас там `%d из %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("⚕️ Статус живучести *%s* на текущую минуту: `%d / %d ПЗ`.", heroName, curHP, maxHP),
+			fmt.Sprintf("🐈‍⬛ Мяу! Докладываю обстановку по *%s*: очков здоровья `%d из %d`.", heroName, curHP, maxHP),
+			fmt.Sprintf("📜 Записал на полях, *%s*: герой *%s* держит строй с `%d / %d ПЗ`.", speaker, heroName, curHP, maxHP),
+			fmt.Sprintf("🏥 Справка из архива: *%s* находится в состоянии `%d / %d ПЗ`.", heroName, curHP, maxHP),
+		})
+
+	// 3. Снаряжение, броня, оружие и КБ (30 вариантов)
+	case containsAny(lower, "кб", "брон", "доспех", "оружи", "меч", "щит", "вооруж", "одет", "надет", "снаряж", "атак", "удар"):
+		return pick([]string{
+			fmt.Sprintf("🛡️ *%s*, по оружейной ведомости *%s* имеет КБ `%d`, надет доспех «%s», в руках — «%s».", speaker, heroName, ac, armor, weapon),
+			fmt.Sprintf("⚔️ Выглянул из-за ширмы: *%s* при параде! КБ `%d`, броня: *%s*, оружие: *%s*.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🐈‍⬛ Обнюхал экипировку *%s*: защита `%d` КБ, на плечах *%s*, наготове *%s*.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🦺 *%s*, сверяюсь с арсеналом: у *%s* сейчас КБ `%d` (%s), в бою использует *%s*.", speaker, heroName, ac, armor, weapon),
+			fmt.Sprintf("🗡️ Клинки наточены, ремни затянуты! У *%s* КБ `%d`, доспех: *%s*, оружие: *%s*.", heroName, ac, armor, weapon),
+			fmt.Sprintf("📜 В реестре снаряжения против *%s* значится: КБ `%d`, броня — *%s*, оружие — *%s*.", heroName, ac, armor, weapon),
+			fmt.Sprintf("👀 %s, заглянул в оружейную карту %s: КБ %d, экипирован в %s и держит %s.", speaker, heroName, ac, armor, weapon),
+			fmt.Sprintf("🛡️ Пробить %s будет непросто — КБ %d! На нём %s, а в руке %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🐾 Постучал когтем по броне %s: звенит солидно! КБ %d (%s), в руке %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("⚔️ Боевая готовность %s, %s: КБ %d, доспех %s, основное оружие — %s.", heroName, speaker, ac, armor, weapon),
+			fmt.Sprintf("🔍 Осмотрел стойку %s: защита равна %d КБ, облачён в %s, вооружён %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🐈‍⬛ Мяу-оружейник докладывает: %s носит %s (КБ %d) и машет %s!", heroName, armor, ac, weapon),
+			fmt.Sprintf("📋 Сводка по экипировке %s, %s: КБ %d, броня — %s, оружие — %s.", heroName, speaker, ac, armor, weapon),
+			fmt.Sprintf("🧥 На %s сейчас %s, что даёт итоговый КБ %d, а в руках замечено: %s.", heroName, armor, ac, weapon),
+			fmt.Sprintf("🗡️ Если дело дойдёт до драки, %s, то %s встретит врагов с КБ %d и %s!", speaker, heroName, ac, weapon),
+			fmt.Sprintf("🛡️ Записано в хронике: %s защищён броней %s (КБ %d) и держит %s.", heroName, armor, ac, weapon),
+			fmt.Sprintf("😼 %s, у %s всё под контролем: КБ %d, на теле %s, в руке %s.", speaker, heroName, ac, armor, weapon),
+			fmt.Sprintf("⚒️ Кузнец бы одобрил: %s носит %s (КБ %d) и управляется с %s.", heroName, armor, ac, weapon),
+			fmt.Sprintf("📖 Открыл страницу снаряжения %s: итоговый КБ %d, доспех %s, оружие %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🐾 Прошёл мимо оружейной стойки %s — там числятся %s (КБ %d) и %s.", heroName, armor, ac, weapon),
+			fmt.Sprintf("⚔️ %s, напоминаю статы %s: класс брони %d, доспех — %s, оружие — %s.", speaker, heroName, ac, armor, weapon),
+			fmt.Sprintf("🛡️ Крепкая броня — залог долгой летописи! У %s КБ %d (%s), в руках %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🐈‍⬛ Уши на макушке! У %s экипированы %s и %s, суммарный КБ %d.", heroName, armor, weapon, ac),
+			fmt.Sprintf("🧾 Инвентаризация доспехов %s, %s: КБ %d, надето %s, в руках %s.", heroName, speaker, ac, armor, weapon),
+			fmt.Sprintf("🗡️ %s готов к засаде: защита %d КБ (%s), наготове %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("👀 Подсмотрел за ширму Мастера: у %s КБ %d, броня %s, оружие %s.", heroName, ac, armor, weapon),
+			fmt.Sprintf("🦺 %s, если что, %s прикрыт %s (КБ %d) и держит %s.", speaker, heroName, armor, ac, weapon),
+			fmt.Sprintf("📜 Пометил в протоколе: %s выступает в %s (КБ %d) с %s наперевес.", heroName, armor, ac, weapon),
+			fmt.Sprintf("🐾 Цап-царап! Поцарапал %s на %s — держит крепко, КБ %d, в руке %s!", armor, heroName, ac, weapon),
+			fmt.Sprintf("⚔️ Арсенал %s в полном порядке, %s: КБ %d, броня %s, оружие %s.", heroName, speaker, ac, armor, weapon),
+		})
+		// 4. Рюкзак, вещи, сухпайки и инвентарь (30 вариантов)
+	case containsAny(lower, "рюкзак", "инвентар", "вещ", "предмет", "слот", "сумк", "мешок", "барахл", "трофе", "лут", "тащ"):
+		return pick([]string{
+			fmt.Sprintf("🎒 %s, я заглянул в вещмешок %s: занято %d / 15 слотов. Пока ещё есть куда складывать трофеи!", speaker, heroName, bagCount),
+			fmt.Sprintf("🐈‍⬛ Порылся лапкой в рюкзаке %s: насчитал %d занятых слотов из 15!", heroName, bagCount),
+			fmt.Sprintf("📦 По складской описи у %s заполнено %d / 15 ячеек рюкзака, %s.", heroName, bagCount, speaker),
+			fmt.Sprintf("🔍 Обнюхал сумку %s — внутри лежит %d позиций (из 15 возможных).", heroName, bagCount),
+			fmt.Sprintf("📜 В инвентарном свитке %s числится %d / 15 занятых слотов!", heroName, bagCount),
+			fmt.Sprintf("🐾 %s, докладываю по поклаже %s: забито %d слотов из 15.", speaker, heroName, bagCount),
+			fmt.Sprintf("🎒 Рюкзак %s загружен на %d / 15 слотов — спина пока держится!", heroName, bagCount),
+			fmt.Sprintf("👀 Подсмотрел, что там звенит у %s за спиной: занято %d / 15 слотов.", heroName, bagCount),
+			fmt.Sprintf("🐈‍⬛ Мяу-кладовщик на связи, %s! У %s в мешке %d из 15 слотов занято.", speaker, heroName, bagCount),
+			fmt.Sprintf("🧳 Сверяюсь с описью имущества %s: использовано %d / 15 ячеек.", heroName, bagCount),
+			fmt.Sprintf("📦 Если собираетесь делить лут, %s, учтите: у %s занято %d / 15 слотов.", speaker, heroName, bagCount),
+			fmt.Sprintf("🐾 Засунул любопытный нос в рюкзак %s — там %d занятых слотов из 15!", heroName, bagCount),
+			fmt.Sprintf("📖 На странице инвентаря %s записано %d / 15 предметов и стопок.", heroName, bagCount),
+			fmt.Sprintf("😏 %s, в вещмешке %s сейчас %d / 15 слотов — половина архива бы поместилась!", speaker, heroName, bagCount),
+			fmt.Sprintf("🎒 Проверил застёжки на сумке %s: внутри %d из 15 слотов.", heroName, bagCount),
+			fmt.Sprintf("🧾 Свежая ревизия рюкзака %s, %s: заполнено %d / 15 ячеек.", heroName, speaker, bagCount),
+			fmt.Sprintf("🐈‍⬛ Вылез из рюкзака %s весь в пыли: там сейчас %d / 15 слотов занято!", heroName, bagCount),
+			fmt.Sprintf("⚖️ Нагрузка под контролем: у %s занято %d из 15 слотов инвентаря.", heroName, bagCount),
+			fmt.Sprintf("🔍 %s, по моим записям %s тащит с собой %d / 15 слотов добра.", speaker, heroName, bagCount),
+			fmt.Sprintf("📦 Свободного места у %s ещё %d слотов (занято %d / 15).", heroName, 15-bagCount, bagCount),
+			fmt.Sprintf("🐾 Поскрёб когтем по дну мешка %s — занято %d / 15 слотов.", heroName, bagCount),
+			fmt.Sprintf("📜 Зафиксировано в гроссбухе, %s: рюкзак %s заполнен на %d / 15.", speaker, heroName, bagCount),
+			fmt.Sprintf("🎒 Не потеряйте ничего на привале! У %s сейчас %d / 15 слотов в сумке.", heroName, bagCount),
+			fmt.Sprintf("🐈‍⬛ Мур! В вещмешке %s уютно устроились %d / 15 слотов поклажи.", heroName, bagCount),
+			fmt.Sprintf("🧳 %s, если нужно кому-то сбагрить трофеи, у %s занято %d / 15 слотов.", speaker, heroName, bagCount),
+			fmt.Sprintf("👀 Краем глаза глянул в поклажу %s: числится %d из 15 слотов.", heroName, bagCount),
+			fmt.Sprintf("📋 Реестр вещей %s актуален: использовано %d / 15 слотов.", heroName, bagCount),
+			fmt.Sprintf("🐾 %s, в сумке %s порядок — занято %d / 15 ячеек.", speaker, heroName, bagCount),
+			fmt.Sprintf("🎒 Походный баул %s вмещает 15 слотов, из них сейчас занято %d.", heroName, bagCount),
+			fmt.Sprintf("🕯️ При свете свечи пересчитал пожитки %s: вышло %d / 15 слотов!", heroName, bagCount),
+		})
+		// 5. Общая реакция на упоминание имени героя (30 вариантов)
+	default:
+		return pick([]string{
+			fmt.Sprintf("🐾 Уши на макушке! Услышал имя %s и сразу раскрыл свиток на нужной главе. Что опять натворили?", heroName),
+			fmt.Sprintf("📜 %s, ты поминаешь %s к добру или мне уже доставать чернила для нового протокола?", speaker, heroName),
+			fmt.Sprintf("🐈‍⬛ Мяу? Кто сказал %s? Я всё слышу и каждое слово в летопись заношу!", heroName),
+			fmt.Sprintf("👀 Высунул нос из архива: обсуждаете %s? Надеюсь, без новых долгов для общей казны!", heroName),
+			fmt.Sprintf("🪶 Скрип-скрип... Пометил на полях, что %s снова в центре внимания отряда!", heroName),
+			fmt.Sprintf("🐾 Топ-топ лапками по столу... Услышал про %s и прибежал послушать из-за ширмы!", heroName),
+			fmt.Sprintf("📖 Открыл биографию %s на свежей странице, %s — диктуйте, что вписывать!", heroName, speaker),
+			fmt.Sprintf("😼 Хм-м-м, %s... Поминаете %s всуе — как бы он сейчас не икнул на проверке Скрытности!", speaker, heroName),
+			fmt.Sprintf("🕯️ Подтащил свечу поближе к свитку %s. Продолжайте, я всё конспектирую!", heroName),
+			fmt.Sprintf("🐈‍⬛ Чёрный кот перебежал дорогу... Ой, то есть выглянул на имя %s! Приветствую, %s!", heroName, speaker),
+			fmt.Sprintf("🎭 О-о-о, речь зашла о %s! Чувствую, сейчас будет либо подвиг, либо комедия!", heroName),
+			fmt.Sprintf("🔍 Навострил усы: что там у %s приключилось на этот раз, %s?", heroName, speaker),
+			fmt.Sprintf("📜 В анналах Украденных земель имя %s встречается подозрительно часто... Записываю дальше!", heroName),
+			fmt.Sprintf("🐾 Пошевелил чёрными ушами: %s снова в деле! Не забудьте потом расписаться в ведомости.", heroName),
+			fmt.Sprintf("👀 %s, я всё вижу! Стоило упомянуть %s, как у меня перо само заплясало по бересте.", speaker, heroName),
+			fmt.Sprintf("🐈‍⬛ Мур-р-р, %s — персонаж колоритный! Жду продолжения истории, %s.", heroName, speaker),
+			fmt.Sprintf("🎲 Закатил кубик за ширму на удачу для %s! О чём толкуем?", heroName),
+			fmt.Sprintf("🪶 Поправил несуществующие очки на носу: досье на %s всегда под рукой!", heroName),
+			fmt.Sprintf("😏 %s, надеюсь, %s не слышит, как вы его тут за глаза обсуждаете!", speaker, heroName),
+			fmt.Sprintf("📖 Перелистнул главу: «Новые приключения %s и компании». Слушаю внимательно!", heroName),
+			fmt.Sprintf("🐾 Высунул лапу из-за стопки книг при имени %s — даю добро на продолжение!", heroName),
+			fmt.Sprintf("🕯️ Сургучная печать наготове! Какую отметку ставим в досье %s, %s?", heroName, speaker),
+			fmt.Sprintf("🐈‍⬛ Кто позвал? А, вы про %s... Ну я всё равно посижу рядом, погрею уши!", heroName),
+			fmt.Sprintf("📜 Заношу в черновик, %s: «Отряд активно обсуждает дальнейшую судьбу %s».", speaker, heroName),
+			fmt.Sprintf("👁️ Архивариус бдит! Любое упоминание %s автоматически попадает в хронику.", heroName),
+			fmt.Sprintf("🐾 Мягко спрыгнул с полки при звуке имени %s — чем могу помочь, %s?", heroName, speaker),
+			fmt.Sprintf("🎭 Барды уже настраивают лютни, услышав имя %s!", heroName),
+			fmt.Sprintf("✒️ Макнул перо в чернильницу: продолжайте про %s, я весь во внимании!", heroName),
+			fmt.Sprintf("😼 %s, если %s опять задумал авантюру — я заранее снимаю с себя ответственность!", speaker, heroName),
+			fmt.Sprintf("📚 Свиток %s зашуршал на полке — чувствует, что о нём говорят в чате!", heroName),
+		})
+	}
 }
