@@ -132,6 +132,7 @@ func (h *BotHandler) Register(b *tele.Bot) {
 
 	b.Handle(&tele.Btn{Unique: "pay_to"}, h.handlePaySelectRecipient)
 	b.Handle(tele.OnText, h.handleTextMessage)
+	b.Handle(tele.OnPhoto, h.handlePhotoMessage)
 }
 
 func (h *BotHandler) handleWebAccess(c tele.Context) error {
@@ -3057,4 +3058,75 @@ func (h *BotHandler) formatNextSessionInfo(ctx context.Context, c tele.Context) 
 		sb.WriteString(fmt.Sprintf("📝 <b>Заметка Мастера:</b> %s\n", html.EscapeString(info.Note)))
 	}
 	return strings.TrimSpace(sb.String())
+}
+func (h *BotHandler) handlePhotoMessage(c tele.Context) error {
+	tgID := c.Sender().ID
+	chatID := c.Chat().ID
+	caption := strings.TrimSpace(c.Message().Caption)
+
+	// 1. Если в подписи к фото позвали Бересту — отвечаем по смыслу подписи
+	if caption != "" && isBotMentioned(caption, c.Bot().Me) {
+		if replyText, handled := h.tryAnswerBerestaRoomQuery(context.Background(), c, caption); handled {
+			return c.Reply(replyText, tele.ModeHTML)
+		}
+
+		speakerName := c.Sender().FirstName
+		isPartyMember := false
+		if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+			speakerName = domain.GetStr(hero.Data, "name", speakerName)
+			isPartyMember = true
+		}
+
+		reply := buildBerestaReply(caption, speakerName, isPartyMember)
+		return c.Reply(reply, tele.ModeMarkdown)
+	}
+
+	// 2. Защита от спама (чтобы не отвечать 10 раз подряд, если скинули альбом фото)
+	if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
+		if time.Since(lastVal.(time.Time)) < 20*time.Second {
+			return nil
+		}
+	}
+	h.lastMentionReply.Store(chatID, time.Now())
+
+	speakerName := c.Sender().FirstName
+	if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+		speakerName = domain.GetStr(hero.Data, "name", speakerName)
+	}
+
+	replies := []string{
+		fmt.Sprintf("🐾 Выглянул из-за ширмы, пошевелил ушами... Ого, *%s*, вот это картинка! Жаль, у меня лапки — перерисовать такое в свиток не выйдет.", speakerName),
+		fmt.Sprintf("🐈‍⬛ Мяу? *%s*, я, конечно, кот-летописец, но даже мои круглые глаза такого ещё не видали!", speakerName),
+		fmt.Sprintf("🖼️ Потыкал лапкой в изображение от *%s*... Вроде не кусается и не пахнет рыбой, но в архив занесу!", speakerName),
+		fmt.Sprintf("👀 Высунул чёрную макушку из-за ширмы Мастера: и что это мы тут рассматриваем, *%s*?", speakerName),
+		fmt.Sprintf("📜 Записал в хронику: «*%s* предъявил отряду загадочное полотно». Надеюсь, это не портрет нашего следующего босса?", speakerName),
+		fmt.Sprintf("🐾 Прошёл мягкими лапками прямо по свежему оттиску... Ой, *%s*, теперь там мои следы! Будем считать это печатью архива.", speakerName),
+		fmt.Sprintf("🎨 Художники Авессалома обзавидовались бы такой иллюстрации, *%s*! Мур-р-р, одобряю.", speakerName),
+		fmt.Sprintf("🧐 Прищурился, дёрнул усом... Любопытный кадр, *%s*! Спрячу его за ширму рядом с любимым d20.", speakerName),
+		fmt.Sprintf("🐈‍⬛ Засмотрелся на картинку от *%s* так, что случайно смахнул хвостом чернильницу со стола!", speakerName),
+		fmt.Sprintf("🔍 Обнюхал картинку со всех углов, *%s* — пахнет приключениями и немножко жареной курицей!", speakerName),
+		fmt.Sprintf("🐾 *%s*, я пытался поймать лапой то, что нарисовано на картинке, но поцарапал только пергамент!", speakerName),
+		fmt.Sprintf("📖 Вклеить это в летопись у меня лапки не дотянутся, *%s*, но я запомню во всех пушистых подробностях!", speakerName),
+		fmt.Sprintf("😼 Хм-м-м, *%s*... Выглядит подозрительно! Кидаем проверку Внимания или сразу шипим и выгибаем спину?", speakerName),
+		fmt.Sprintf("🎲 Закатил кубик под ширму от удивления, *%s*! Где ты только такие кадры откапываешь?", speakerName),
+		fmt.Sprintf("🐈‍⬛ Уши на макушке, глаза по пять золотых — Береста внимательно изучает шедевр от *%s*!", speakerName),
+		fmt.Sprintf("🖼️ Повешу это на внутреннюю сторону ширмы Мастера для вдохновения, *%s*!", speakerName),
+		fmt.Sprintf("🐾 Топ-топ лапками по столу... Подошёл поближе разглядеть твою картинку, *%s*. Годно!", speakerName),
+		fmt.Sprintf("🪶 Попытался зарисовать это гусиным пером, *%s*, но получился только клубок шерсти и две кляксы.", speakerName),
+		fmt.Sprintf("😺 Мур! Вот ради таких картинок в чате я и терплю ваши бесконечные споры у закрытых дверей, *%s*!", speakerName),
+		fmt.Sprintf("🕯️ Подтащил свечу поближе к изображению от *%s*... Осторожно, чуть усы не опалил!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *%s*, если это карта сокровищ — я первый в очереди за долей в виде сметаны и блестящих монеток!", speakerName),
+		fmt.Sprintf("👀 Смотрю в оба глаза, *%s*! Ни одна деталь мимо пушистого архивариуса не проскочит.", speakerName),
+		fmt.Sprintf("🎭 Ох уж эти ваши художества, *%s*! Аж хвост трубой встал от неожиданности.", speakerName),
+		fmt.Sprintf("📜 Заношу в раздел «Наглядные улики»: «*%s* притащил в лагерь нечто любопытное».", speakerName),
+		fmt.Sprintf("🐾 Поскрёб когтем по рамке... Красивое, *%s*! Но сбрасывать со стола я это, так и быть, не буду.", speakerName),
+		fmt.Sprintf("😼 *%s*, судя по этому изображению, нас впереди ждёт либо великая добыча, либо великий кусь!", speakerName),
+		fmt.Sprintf("🔮 Поглядел на картинку сквозь граненый d20, *%s*... Похоже, это к скорой встрече с неприятностями!", speakerName),
+		fmt.Sprintf("🐈‍⬛ Свернулся калачиком рядом с этой иллюстрацией, *%s* — уж больно уютный кадр!", speakerName),
+		fmt.Sprintf("🖌️ Отличная работа, *%s*! Выписываю тебе официальное «Мяу одобрения» от хранителя архивов.", speakerName),
+		fmt.Sprintf("🐾 Выглянул из-за ширмы на шум, а тут *%s* красоту показывает! Продолжайте, я наблюдаю.", speakerName),
+	}
+
+	reply := replies[rand.Intn(len(replies))]
+	return c.Reply(reply, tele.ModeMarkdown)
 }
