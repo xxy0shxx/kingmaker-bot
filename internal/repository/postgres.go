@@ -1070,29 +1070,6 @@ func (r *HeroRepository) GetRoomSituation(ctx context.Context, chatID, senderID 
 		return nil, fmt.Errorf("данные карты не найдены")
 	}
 
-	if isPrivate {
-		err := r.db.QueryRow(ctx, `
-			SELECT cs.room_code, cs.map_data
-			FROM public.campaign_heroes ch
-			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
-			WHERE ch.telegram_user_id = $1
-			LIMIT 1
-		`, senderID).Scan(&roomCode, &rawMap)
-		if err != nil {
-			return nil, fmt.Errorf("персонаж не привязан к кампании")
-		}
-	} else {
-		err := r.db.QueryRow(ctx, `
-			SELECT room_code, map_data
-			FROM public.campaign_state
-			WHERE telegram_chat_id = $1
-			LIMIT 1
-		`, chatID).Scan(&roomCode, &rawMap)
-		if err != nil {
-			return nil, fmt.Errorf("этот чат не привязан к игровой комнате")
-		}
-	}
-
 	sit := &RoomSituation{RoomCode: roomCode}
 
 	terrainRu := map[string]string{
@@ -1237,28 +1214,6 @@ func (r *HeroRepository) GetRoomQuestsAndRumors(ctx context.Context, chatID, sen
 	var rawMap []byte
 	if err := r.db.QueryRow(ctx, `SELECT map_data FROM public.campaign_state WHERE room_code = $1 LIMIT 1`, roomCode).Scan(&rawMap); err != nil {
 		return nil, err
-	}
-	if isPrivate {
-		err := r.db.QueryRow(ctx, `
-			SELECT cs.map_data
-			FROM public.campaign_heroes ch
-			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
-			WHERE ch.telegram_user_id = $1
-			LIMIT 1
-		`, senderID).Scan(&rawMap)
-		if err != nil {
-			return nil, fmt.Errorf("персонаж не привязан к кампании")
-		}
-	} else {
-		err := r.db.QueryRow(ctx, `
-			SELECT map_data
-			FROM public.campaign_state
-			WHERE telegram_chat_id = $1
-			LIMIT 1
-		`, chatID).Scan(&rawMap)
-		if err != nil {
-			return nil, fmt.Errorf("этот чат не привязан к игровой комнате")
-		}
 	}
 
 	var mapData map[string]any
@@ -1510,25 +1465,11 @@ func (r *HeroRepository) GetRoomSupplies(ctx context.Context, chatID, senderID i
 	if err != nil {
 		return nil, err
 	}
-	if isPrivate {
-		err := r.db.QueryRow(ctx, `
-			SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
-		`, senderID).Scan(&roomCode)
-		if err != nil {
-			return nil, fmt.Errorf("персонаж не привязан к кампании")
-		}
-	} else {
-		err := r.db.QueryRow(ctx, `
-			SELECT room_code FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
-		`, chatID).Scan(&roomCode)
-		if err != nil {
-			return nil, fmt.Errorf("этот чат не привязан к игровой комнате")
-		}
-	}
 
 	rows, err := r.db.Query(ctx, `
 		SELECT hero_data FROM public.campaign_heroes WHERE room_code = $1 ORDER BY updated_at ASC
 	`, roomCode)
+
 	if err != nil {
 		return nil, err
 	}
@@ -1702,26 +1643,6 @@ func (r *HeroRepository) GetNextSession(ctx context.Context, chatID, senderID in
 		return nil, err
 	}
 
-	if !isPrivate {
-		err := r.db.QueryRow(ctx, `
-			SELECT room_code, COALESCE(telegram_chat_id, 0), map_data
-			FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
-		`, chatID).Scan(&roomCode, &groupChatID, &rawMap)
-		if err != nil {
-			return nil, fmt.Errorf("чат не привязан к комнате")
-		}
-	} else {
-		err := r.db.QueryRow(ctx, `
-			SELECT cs.room_code, COALESCE(cs.telegram_chat_id, 0), cs.map_data
-			FROM public.campaign_heroes ch
-			JOIN public.campaign_state cs ON cs.room_code = ch.room_code
-			WHERE ch.telegram_user_id = $1 LIMIT 1
-		`, senderID).Scan(&roomCode, &groupChatID, &rawMap)
-		if err != nil {
-			return nil, fmt.Errorf("персонаж не привязан к кампании")
-		}
-	}
-
 	var mapData map[string]any
 	if err := json.Unmarshal(rawMap, &mapData); err != nil {
 		return nil, err
@@ -1775,21 +1696,6 @@ func (r *HeroRepository) GetRoomActiveHeroes(ctx context.Context, chatID, sender
 	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
 	if err != nil {
 		return nil, err
-	}
-	if isPrivate {
-		err := r.db.QueryRow(ctx, `
-			SELECT room_code FROM public.campaign_heroes WHERE telegram_user_id = $1 LIMIT 1
-		`, senderID).Scan(&roomCode)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		err := r.db.QueryRow(ctx, `
-			SELECT room_code FROM public.campaign_state WHERE telegram_chat_id = $1 LIMIT 1
-		`, chatID).Scan(&roomCode)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	rows, err := r.db.Query(ctx, `
