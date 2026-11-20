@@ -31,6 +31,7 @@ type BotHandler struct {
 	repo                *repository.HeroRepository
 	gear                *catalog.GearStore
 	mainMenu            *tele.ReplyMarkup
+	adminMenu           *tele.ReplyMarkup
 	btnMe               tele.Btn
 	btnSpell            tele.Btn
 	btnEquip            tele.Btn
@@ -38,10 +39,13 @@ type BotHandler struct {
 	btnGive             tele.Btn
 	btnPay              tele.Btn
 	btnWeb              tele.Btn
+	btnAdmin            tele.Btn
 	pendingPays         sync.Map
 	pendingShopSearches sync.Map
+	pendingAdminVotes   sync.Map
 	lastMentionReply    sync.Map
 	mutedChats          sync.Map
+	activePolls         sync.Map
 }
 
 func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore) *BotHandler {
@@ -60,18 +64,36 @@ func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore) *Bo
 		menu.Row(btnWeb),
 	)
 
+	admMenu := &tele.ReplyMarkup{ResizeKeyboard: true}
+	btnAdmin := admMenu.Text("👑 Панель Мастера")
+	admMenu.Reply(
+		admMenu.Row(btnMe, btnSpell),
+		admMenu.Row(btnEquip, btnShop),
+		admMenu.Row(btnGive, btnPay),
+		admMenu.Row(btnWeb, btnAdmin),
+	)
+
 	return &BotHandler{
-		repo:     repo,
-		gear:     gear,
-		mainMenu: menu,
-		btnMe:    btnMe,
-		btnSpell: btnSpell,
-		btnEquip: btnEquip,
-		btnShop:  btnShop,
-		btnGive:  btnGive,
-		btnPay:   btnPay,
-		btnWeb:   btnWeb,
+		repo:      repo,
+		gear:      gear,
+		mainMenu:  menu,
+		adminMenu: admMenu,
+		btnMe:     btnMe,
+		btnSpell:  btnSpell,
+		btnEquip:  btnEquip,
+		btnShop:   btnShop,
+		btnGive:   btnGive,
+		btnPay:    btnPay,
+		btnWeb:    btnWeb,
+		btnAdmin:  btnAdmin,
 	}
+}
+
+func (h *BotHandler) menuFor(userID int64) *tele.ReplyMarkup {
+	if IsAdmin(userID) {
+		return h.adminMenu
+	}
+	return h.mainMenu
 }
 
 func (h *BotHandler) Register(b *tele.Bot) {
@@ -121,6 +143,12 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle("/item", h.handleItemCommand)
 	b.Handle(&tele.Btn{Unique: "item_view"}, h.handleItemViewCallback)
 
+	b.Handle("/track_poll", h.handleTrackPollCommand)
+
+	b.Handle("/admin", h.handleAdminMenu)
+	b.Handle(&h.btnAdmin, h.handleAdminMenu)
+	b.Handle(&tele.Btn{Unique: "adm"}, h.handleAdminAction)
+
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
@@ -131,12 +159,20 @@ func (h *BotHandler) Register(b *tele.Bot) {
 		_ = c.Respond()
 		h.pendingPays.Delete(c.Sender().ID)
 		h.pendingShopSearches.Delete(c.Sender().ID)
+		h.pendingAdminVotes.Delete(c.Sender().ID)
 		return c.Edit("❌ Операция отменена.")
 	})
 
 	b.Handle(&tele.Btn{Unique: "pay_to"}, h.handlePaySelectRecipient)
 	b.Handle(tele.OnText, h.handleTextMessage)
 	b.Handle(tele.OnPhoto, h.handlePhotoMessage)
+	b.Handle(tele.OnSticker, h.handleStickerMessage)
+	b.Handle(tele.OnPoll, func(c tele.Context) error {
+		if p := c.Poll(); p != nil {
+			h.activePolls.Store(p.ID, p)
+		}
+		return nil
+	})
 }
 
 func (h *BotHandler) handleWebAccess(c tele.Context) error {
@@ -238,12 +274,18 @@ func (h *BotHandler) handleStart(c tele.Context) error {
 
 	hero, err := h.repo.GetHeroByTgID(ctx, tgID)
 	if err != nil {
+		if IsAdmin(tgID) {
+			return c.Send(
+				"👑 Привет, Мастер! Персонаж к аккаунту не привязан, но панель управления кампанией доступна по кнопке ниже.",
+				h.menuFor(tgID),
+			)
+		}
 		return c.Send("👋 Привет! Ваш аккаунт ещё не привязан к персонажу.\nПопросите у Мастера персональную ссылку привязки из меню героя.")
 	}
 
 	return c.Send(
 		fmt.Sprintf("👋 С возвращением! Активный персонаж: *%s*", domain.GetStr(hero.Data, "name", "Герой")),
-		h.mainMenu,
+		h.menuFor(tgID),
 		tele.ModeMarkdown,
 	)
 }
@@ -504,6 +546,15 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 			h.mainMenu,
 			tele.ModeMarkdown,
 		)
+	}
+	if _, creatingVote := h.pendingAdminVotes.Load(tgID); creatingVote {
+		h.pendingAdminVotes.Delete(tgID)
+		raw := strings.TrimSpace(c.Text())
+		if raw == "" || strings.HasPrefix(raw, "/") {
+			return nil
+		}
+		c.Message().Payload = raw
+		return h.handleVoteCommand(c)
 	}
 	if _, searching := h.pendingShopSearches.Load(tgID); searching {
 		q := strings.TrimSpace(c.Text())
@@ -3248,7 +3299,12 @@ func (h *BotHandler) handleVoteCommand(c tele.Context) error {
 
 	// Если команда отправлена в групповом чате — запускаем опрос прямо там
 	if c.Chat().Type != tele.ChatPrivate {
-		return c.Send(poll)
+		sentMsg, err := c.Bot().Send(c.Chat(), poll)
+		if err != nil {
+			return err
+		}
+		h.schedulePollCheck(c.Bot(), sentMsg, 1*time.Hour)
+		return nil
 	}
 
 	// Если отправлено в ЛС — публикуем опрос в групповой чат кампании игрока
@@ -3257,11 +3313,14 @@ func (h *BotHandler) handleVoteCommand(c tele.Context) error {
 		return c.Send(fmt.Sprintf("⚠️ Не удалось запустить опрос в группе: %s.", html.EscapeString(err.Error())))
 	}
 
-	if _, err := c.Bot().Send(&tele.Chat{ID: groupChatID}, poll); err != nil {
+	sentMsg, err := c.Bot().Send(&tele.Chat{ID: groupChatID}, poll)
+	if err != nil {
 		return c.Send(fmt.Sprintf("❌ Ошибка отправки опроса в чат партии: %v", err))
 	}
+	h.schedulePollCheck(c.Bot(), sentMsg, 1*time.Hour)
 
-	return c.Send("✅ Голосование запущено в групповом чате партии!")
+	return c.Send("✅ Голосование запущено в групповом чате партии! Через 1 час я проверю явку.")
+
 }
 
 // --- Доска объявлений / Напоминание о следующей сессии (/session) ---
@@ -4213,4 +4272,594 @@ func (h *BotHandler) handleItemViewCallback(c tele.Context) error {
 		return c.Edit("⚠️ Предмет не найден в каталоге.")
 	}
 	return c.Edit(formatGearCardHTML(*item), tele.ModeHTML)
+}
+
+// --- Инлайн-панель администратора (/admin) ---
+
+func (h *BotHandler) buildAdminPanel(ctx context.Context, c tele.Context) (string, *tele.ReplyMarkup) {
+	targetChatID := c.Chat().ID
+	if c.Chat().Type == tele.ChatPrivate {
+		if grpID, err := h.repo.GetPlayerGroupChatID(ctx, c.Sender().ID); err == nil && grpID != 0 {
+			targetChatID = grpID
+		}
+	}
+
+	_, isMuted := h.mutedChats.Load(targetChatID)
+	muteBtnText := "🤐 Усыпить Бересту в группе"
+	muteStateLabel := "🔊 <b>Голос Бересты:</b> активен"
+	if isMuted {
+		muteBtnText = "🐾 Разбудить Бересту в группе"
+		muteStateLabel = "🤐 <b>Голос Бересты:</b> режим тишины"
+	}
+
+	inline := &tele.ReplyMarkup{}
+	inline.Inline(
+		inline.Row(
+			inline.Data("📜 Итоги сессии", "adm", "summary"),
+			inline.Data("📅 След. сессия", "adm", "session"),
+		),
+		inline.Row(
+			inline.Data("🗺️ Сводка партии", "adm", "situation"),
+			inline.Data("🍞 Пайки и квесты", "adm", "supplies"),
+		),
+		inline.Row(
+			inline.Data("🧭 Голосование", "adm", "vote_menu"),
+			inline.Data("🚀 Релизы", "adm", "releases"),
+		),
+		inline.Row(
+			inline.Data("📊 Статус БД", "adm", "status"),
+			inline.Data(muteBtnText, "adm", "toggle_mute"),
+		),
+		inline.Row(
+			inline.Data("✖ Закрыть панель", "tr_cancel", "0"),
+		),
+	)
+
+	text := fmt.Sprintf(
+		"👑 <b>Панель управления Мастера</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"%s\n"+
+			"<i>Выберите раздел или действие ниже:</i>",
+		muteStateLabel,
+	)
+	return text, inline
+}
+
+func (h *BotHandler) handleAdminMenu(c tele.Context) error {
+	if !IsAdmin(c.Sender().ID) {
+		return c.Send("⛔ Эта команда доступна только Мастерам кампании.")
+	}
+	text, inline := h.buildAdminPanel(context.Background(), c)
+	return c.Send(text, inline, tele.ModeHTML)
+}
+
+func (h *BotHandler) handleAdminAction(c tele.Context) error {
+	_ = c.Respond()
+	if !IsAdmin(c.Sender().ID) {
+		return nil
+	}
+
+	ctx := context.Background()
+	action := strings.TrimSpace(c.Callback().Data)
+	backMarkup := &tele.ReplyMarkup{}
+	backMarkup.Inline(backMarkup.Row(backMarkup.Data("⬅️ В панель Мастера", "adm", "home")))
+
+	switch action {
+	case "home":
+		text, inline := h.buildAdminPanel(ctx, c)
+		return c.Edit(text, inline, tele.ModeHTML)
+
+	case "summary":
+		isPriv := c.Chat().Type == tele.ChatPrivate
+		sum, err := h.repo.GetSessionSummary(ctx, c.Chat().ID, c.Sender().ID, isPriv)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("❌ Не удалось собрать итоги: %s", html.EscapeString(err.Error())), backMarkup, tele.ModeHTML)
+		}
+		text := formatSessionSummaryHTML(sum)
+		inline := &tele.ReplyMarkup{}
+		var rows []tele.Row
+		if isPriv && sum.TelegramChatID != 0 {
+			rows = append(rows, inline.Row(inline.Data("📢 Опубликовать в чат партии", "sum_pub", sum.RoomCode)))
+		}
+		rows = append(rows, inline.Row(inline.Data("⬅️ В панель Мастера", "adm", "home")))
+		inline.Inline(rows...)
+		return c.Edit(text, inline, tele.ModeHTML)
+
+	case "session":
+		infoText := h.formatNextSessionInfo(ctx, c)
+		msg := infoText + "\n\n" +
+			"✏️ <b>Назначить новую дату:</b>\n" +
+			"<code>/session ДД.ММ.ГГГГ ЧЧ:ММ | Заметка</code>"
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(
+			inline.Row(inline.Data("🗑️ Снять с доски объявлений", "adm", "session_clear")),
+			inline.Row(inline.Data("⬅️ В панель Мастера", "adm", "home")),
+		)
+		return c.Edit(msg, inline, tele.ModeHTML)
+
+	case "session_clear":
+		isPriv := c.Chat().Type == tele.ChatPrivate
+		if _, err := h.repo.SetNextSession(ctx, c.Chat().ID, c.Sender().ID, isPriv, "", ""); err != nil {
+			return c.Edit(fmt.Sprintf("❌ Ошибка: %s", html.EscapeString(err.Error())), backMarkup, tele.ModeHTML)
+		}
+		return c.Edit("🗑️ Объявление о следующей сессии снято с доски.", backMarkup, tele.ModeHTML)
+
+	case "situation":
+		sit, err := h.repo.GetRoomSituation(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("❌ Ошибка: %s", html.EscapeString(err.Error())), backMarkup, tele.ModeHTML)
+		}
+		loc := sit.HexCoord
+		if sit.HexTitle != "" {
+			loc = fmt.Sprintf("%s (%s)", html.EscapeString(sit.HexTitle), html.EscapeString(sit.HexCoord))
+		}
+		var sb strings.Builder
+		sb.WriteString("🗺️ <b>Оперативная сводка кампании</b>\n━━━━━━━━━━━━━━━━━━━━\n")
+		sb.WriteString(fmt.Sprintf("📍 <b>Позиция:</b> %s (%s)\n", loc, html.EscapeString(sit.HexTerrain)))
+		if sit.Weather != "" {
+			sb.WriteString(fmt.Sprintf("🌤️ <b>Погода:</b> %s\n", html.EscapeString(sit.Weather)))
+		}
+		sb.WriteString(fmt.Sprintf("💰 <b>Казна отряда:</b> <code>%d ЗМ • %d СМ • %d ММ</code>\n\n", sit.TreasuryGold, sit.TreasurySilv, sit.TreasuryCopp))
+		sb.WriteString("🛡️ <b>Герои:</b>\n")
+		for _, hb := range sit.Heroes {
+			sb.WriteString(fmt.Sprintf("• <b>%s</b> (%d ур.): <code>%d/%d ПЗ</code> • <code>%d ЗМ</code>\n",
+				html.EscapeString(hb.Name), hb.Level, hb.CurHP, hb.MaxHP, hb.TotalCp/100))
+		}
+		return c.Edit(strings.TrimSpace(sb.String()), backMarkup, tele.ModeHTML)
+
+	case "supplies":
+		supText := h.formatRoomSupplies(ctx, c)
+		questText := h.formatRoomQuestsAndRumors(ctx, c)
+		return c.Edit(supText+"\n\n"+questText, backMarkup, tele.ModeHTML)
+
+	case "releases":
+		_ = h.handleTestRelease(c)
+		return nil
+
+	case "status":
+		st, err := h.repo.GetSystemStatus(ctx)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("❌ Ошибка БД: %v", err), backMarkup, tele.ModeHTML)
+		}
+		watcherState := "▶️ Включён"
+		if st.IsPaused {
+			watcherState = "⏸ На паузе"
+		}
+		gearCount := 0
+		if h.gear != nil {
+			gearCount = h.gear.Count()
+		}
+		msg := fmt.Sprintf(
+			"📊 <b>Статус системы</b>\n━━━━━━━━━━━━━━━━━━━━\n"+
+				"🌐 <b>Веб:</b> <code>%s</code> • 🤖 <b>Бот:</b> <code>%s</code>\n"+
+				"🔄 <b>Вотчер релизов:</b> %s\n"+
+				"💬 <b>Чатов:</b> <code>%d</code> • 🛡️ <b>Героев:</b> <code>%d</code> (TG: <code>%d</code>)\n"+
+				"📦 <b>Каталог:</b> <code>%d</code> поз. • 📬 <b>Очередь:</b> <code>%d</code>",
+			html.EscapeString(st.WebVersion), html.EscapeString(st.BotVersion),
+			watcherState, st.TrackedChats, st.TotalHeroes, st.LinkedHeroes, gearCount, st.PendingQueue,
+		)
+		return c.Edit(msg, backMarkup, tele.ModeHTML)
+
+	case "toggle_mute":
+		targetChatID := c.Chat().ID
+		if c.Chat().Type == tele.ChatPrivate {
+			if grpID, err := h.repo.GetPlayerGroupChatID(ctx, c.Sender().ID); err == nil && grpID != 0 {
+				targetChatID = grpID
+			}
+		}
+		if _, isMuted := h.mutedChats.Load(targetChatID); isMuted {
+			h.mutedChats.Delete(targetChatID)
+		} else {
+			h.mutedChats.Store(targetChatID, true)
+		}
+		text, inline := h.buildAdminPanel(ctx, c)
+		return c.Edit(text, inline, tele.ModeHTML)
+	case "vote_menu":
+		inline := &tele.ReplyMarkup{}
+		inline.Inline(
+			inline.Row(inline.Data("✍️ Написать свой вопрос", "adm", "vote_custom")),
+			inline.Row(inline.Data("🗓️ Опрос: Когда следующая игра?", "adm", "vote_day")),
+			inline.Row(inline.Data("🧭 Опрос: Куда отправляется отряд?", "adm", "vote_route")),
+			inline.Row(inline.Data("⬅️ В панель Мастера", "adm", "home")),
+		)
+		return c.Edit("🧭 <b>Голосование отряда в групповом чате</b>\nВыберите готовый шаблон или введите свой опрос:", inline, tele.ModeHTML)
+
+	case "vote_custom":
+		h.pendingAdminVotes.Store(c.Sender().ID, true)
+		cancelMarkup := &tele.ReplyMarkup{}
+		cancelMarkup.Inline(cancelMarkup.Row(cancelMarkup.Data("✖ Отмена", "tr_cancel", "0")))
+		return c.Edit(
+			"✍️ <b>Создание опроса для чата партии</b>\n\n"+
+				"Напишите вопрос и варианты ответа через <code>|</code> (от 2 до 10 вариантов), и опрос сразу улетит в группу:\n\n"+
+				"<code>Завтра играем в 19:00? | Да | Опоздаю | Не смогу</code>",
+			cancelMarkup,
+			tele.ModeHTML,
+		)
+	case "vote_day":
+		groupChatID, err := h.repo.GetPlayerGroupChatID(ctx, c.Sender().ID)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("⚠️ %s", html.EscapeString(err.Error())), backMarkup, tele.ModeHTML)
+		}
+		poll := &tele.Poll{
+			Question:        "🗓️ Когда собираемся на следующую игровую сессию?",
+			Anonymous:       false,
+			MultipleAnswers: true,
+		}
+		poll.AddOptions("Пятница вечером", "Суббота", "Воскресенье", "В будний день вечером", "На этой неделе не смогу")
+		sentMsg, err := c.Bot().Send(&tele.Chat{ID: groupChatID}, poll)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("❌ Ошибка запуска опроса: %v", err), backMarkup, tele.ModeHTML)
+		}
+		h.schedulePollCheck(c.Bot(), sentMsg, 1*time.Hour)
+		return c.Edit("✅ Опрос о дате следующей игры запущен в групповом чате партии!", backMarkup, tele.ModeHTML)
+
+	case "vote_route":
+		groupChatID, err := h.repo.GetPlayerGroupChatID(ctx, c.Sender().ID)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("⚠️ %s", html.EscapeString(err.Error())), backMarkup, tele.ModeHTML)
+		}
+		poll := &tele.Poll{
+			Question:  "🧭 Какой дальнейший план действий выбирает отряд?",
+			Anonymous: false,
+		}
+		poll.AddOptions("Разведка новых гексов", "Выполнение активного квеста", "Возврат в поселение / отдых", "Управление королевством")
+		sentMsg, err := c.Bot().Send(&tele.Chat{ID: groupChatID}, poll)
+		if err != nil {
+			return c.Edit(fmt.Sprintf("❌ Ошибка запуска опроса: %v", err), backMarkup, tele.ModeHTML)
+		}
+		h.schedulePollCheck(c.Bot(), sentMsg, 1*time.Hour)
+		return c.Edit("✅ Опрос о маршруте отряда запущен в групповом чате партии!", backMarkup, tele.ModeHTML)
+	}
+
+	return nil
+}
+
+// schedulePollCheck проверяет явку через 1 час, затем каждые 4 часа (только если число голосующих изменилось),
+// а через 24 часа закрывает опрос и подводит финальные итоги.
+func (h *BotHandler) schedulePollCheck(b *tele.Bot, sentMsg *tele.Message, firstDelay time.Duration) {
+	if b == nil || sentMsg == nil || sentMsg.Chat == nil || sentMsg.Poll == nil {
+		return
+	}
+	chatID := sentMsg.Chat.ID
+	pollID := sentMsg.Poll.ID
+	h.activePolls.Store(pollID, sentMsg.Poll)
+
+	const minPlayersNeeded = 5 // Минимум 4 игрока для старта (из 7 возможных + ГМ)
+	const maxPlayersPool = 7   // Всего возможных игроков в группе
+
+	startTime := time.Now()
+	lastReportedVoters := -1
+	quorumReachedAnnounced := false
+
+	// Функция одной промежуточной проверки
+	checkProgress := func(isFirstCheck bool) bool {
+		val, ok := h.activePolls.Load(pollID)
+		if !ok {
+			return false
+		}
+		poll, ok := val.(*tele.Poll)
+		if !ok || poll == nil || poll.Closed {
+			return false
+		}
+
+		// Количество уникальных проголосовавших людей
+		uniqueVoters := poll.VoterCount
+		if uniqueVoters == 0 {
+			for _, opt := range poll.Options {
+				uniqueVoters += opt.VoterCount
+			}
+		}
+
+		// После первого часа пишем ТОЛЬКО если количество голосующих изменилось
+		if !isFirstCheck && uniqueVoters == lastReportedVoters {
+			return true
+		}
+		lastReportedVoters = uniqueVoters
+
+		// Считаем подтвердивших участие и отказавшихся
+		yesVotes := 0
+		declineVotes := 0
+		var leaderOption string
+		maxOptVotes := 0
+
+		for _, opt := range poll.Options {
+			optLower := strings.ToLower(strings.ReplaceAll(opt.Text, "ё", "е"))
+			if containsAny(optLower, "не смог", "не прид", "пас", "нет", "не буду", "пропущ", "занят") {
+				declineVotes += opt.VoterCount
+			} else {
+				yesVotes += opt.VoterCount
+				if opt.VoterCount > maxOptVotes {
+					maxOptVotes = opt.VoterCount
+					leaderOption = opt.Text
+				}
+			}
+		}
+
+		// Если активных игроков набралось 4 или больше (с поправкой, если ГМ тоже нажал «за»)
+		if yesVotes >= minPlayersNeeded {
+			if !quorumReachedAnnounced {
+				quorumReachedAnnounced = true
+				msg := fmt.Sprintf(
+					"🎺 *Отряд для игры собран!*\n"+
+						"🛡️ Подтвердили участие: `%d` из `%d` игроков (минимум `4` для старта набран)!\n"+
+						"🗳️ Лидирует вариант: *«%s»* (`%d` гол.).\n"+
+						"⚔️ Опрос остаётся открытым до истечения суток для остальных участников!",
+					yesVotes, maxPlayersPool, leaderOption, maxOptVotes,
+				)
+				_, _ = b.Send(&tele.Chat{ID: chatID}, msg, tele.ModeMarkdown)
+			} else {
+				msg := fmt.Sprintf(
+					"🐾 *Пополнение в рядах!* Проголосовало уже `%d` чел. (готовых к игре: `%d` из `%d`). Лидирует: *«%s»* (`%d` гол.).",
+					uniqueVoters, yesVotes, maxPlayersPool, leaderOption, maxOptVotes,
+				)
+				_, _ = b.Send(&tele.Chat{ID: chatID}, msg, tele.ModeMarkdown)
+			}
+			return true
+		}
+
+		// Если 4 игрока ещё не набрались — подбадриваем и пишем, сколько не хватает
+		missing := minPlayersNeeded - yesVotes
+		reply := buildPollEncouragementReply(yesVotes, missing, maxPlayersPool)
+		_, _ = b.Send(&tele.Chat{ID: chatID}, reply, tele.ModeMarkdown)
+		return true
+	}
+
+	// Запускаем цикл проверок: 1 час -> +4 ч -> +4 ч -> +4 ч -> +4 ч -> +4 ч (до 24 часов)
+	go func() {
+		// 1. Первая проверка через 1 час
+		timer := time.NewTimer(firstDelay)
+		defer timer.Stop()
+		<-timer.C
+
+		if !checkProgress(true) {
+			return
+		}
+
+		// 2. Последующие проверки каждые 4 часа (пока не пройдёт ~23 часа от старта)
+		ticker := time.NewTicker(4 * time.Hour)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if time.Since(startTime) >= 23*time.Hour {
+				return
+			}
+			if !checkProgress(false) {
+				return
+			}
+		}
+	}()
+
+	// 3. Финальное закрытие опроса и подведение итогов ровно через 24 часа
+	time.AfterFunc(24*time.Hour, func() {
+		defer h.activePolls.Delete(pollID)
+
+		poll, err := b.StopPoll(sentMsg)
+		if err != nil || poll == nil {
+			if val, ok := h.activePolls.Load(pollID); ok {
+				poll, _ = val.(*tele.Poll)
+			}
+		}
+		if poll == nil {
+			return
+		}
+
+		totalVotes := 0
+		yesVotes := 0
+		maxVotes := 0
+		var winners []string
+		var lines []string
+
+		for _, opt := range poll.Options {
+			totalVotes += opt.VoterCount
+			optLower := strings.ToLower(strings.ReplaceAll(opt.Text, "ё", "е"))
+			isDecline := containsAny(optLower, "не смог", "не прид", "пас", "нет", "не буду", "пропущ", "занят")
+			if !isDecline {
+				yesVotes += opt.VoterCount
+				if opt.VoterCount > maxVotes {
+					maxVotes = opt.VoterCount
+					winners = []string{opt.Text}
+				} else if opt.VoterCount > 0 && opt.VoterCount == maxVotes {
+					winners = append(winners, opt.Text)
+				}
+			}
+			lines = append(lines, fmt.Sprintf("• %s — `%d` гол.", opt.Text, opt.VoterCount))
+		}
+
+		var sb strings.Builder
+		sb.WriteString("📜 *Сутки минули — голосование закрыто!*\n")
+		sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
+		sb.WriteString(fmt.Sprintf("❓ *Вопрос:* %s\n\n", poll.Question))
+		sb.WriteString(strings.Join(lines, "\n") + "\n\n")
+
+		if totalVotes == 0 || maxVotes == 0 {
+			sb.WriteString("🕯️ _Никто так и не отметился за сутки. Архивариус сворачивает свиток без вынесенного решения!_")
+		} else if yesVotes < minPlayersNeeded {
+			sb.WriteString(fmt.Sprintf("☕ *Итог:* набралось `%d` из `4` необходимых игроков. Видимо, в этот раз устраиваем привал в таверне и переносим сбор!", yesVotes))
+		} else if len(winners) == 1 {
+			sb.WriteString(fmt.Sprintf("🏆 *Кворум собран (`%d` из `%d` игроков)! Решение отряда:* *«%s»* (`%d` гол.)!", yesVotes, maxPlayersPool, winners, maxVotes))
+		} else {
+			sb.WriteString(fmt.Sprintf("⚖️ *Кворум собран (`%d` из `%d` игроков), но вышла ничья:* *«%s»* (по `%d` гол.)! Решающее слово за Мастером.", yesVotes, maxPlayersPool, strings.Join(winners, "», «"), maxVotes))
+		}
+
+		_, _ = b.Send(&tele.Chat{ID: chatID}, sb.String(), tele.ModeMarkdown)
+	})
+}
+
+func buildPollEncouragementReply(yesVotes, missing, maxPool int) string {
+	statusLine := fmt.Sprintf("_(отметились: `%d` из `%d` чел. — до минимального состава `4 + ГМ` не хватает ещё `%d`)_", yesVotes, maxPool, missing)
+
+	replies := []string{
+		"🤗 *Пока отряд ещё не набрался, но не вешаем нос!* Даже великим искателям приключений нужно время разгрести дела в реальном мире. Ждём остальных героев!\n" + statusLine,
+		"🕯️ *Свеча в архиве горит, свитки развёрнуты, а кворума пока нет.* Никакой паники! Украденные земли никуда не убегут — подтягивайтесь, как освободитесь!\n" + statusLine,
+		"🐾 *Выглянул из-за ширмы, пересчитал голоса...* Пока маловато для штурма подземелья, но вечер ещё впереди! Кто ещё не нажал на кнопку — самое время!\n" + statusLine,
+		"☕ *Похоже, часть отряда пока застряла в таверне или на работе!* Не переживайте — завариваем чайку, ждём подкрепление и верим в лучшее!\n" + statusLine,
+		"📜 *Проверил явку без паники и уныния!* Бывают дни, когда герои собираются не сразу. Береста на посту и ждёт, когда нас станет достаточно для похода!\n" + statusLine,
+		"🐈‍⬛ *Мур-р-р, не грустите, что состав пока неполный!* Зато есть лишний часок отполировать доспехи, зарядить кубики и придумать пару коварных планов!\n" + statusLine,
+		"🌈 *Звёзды говорят, что подкрепление уже в пути!* Не расстраиваемся, голосуем, кто ещё не успел — и обязательно соберёмся!\n" + statusLine,
+		"🛡️ *Кворума пока нет, но боевой дух ронять запрещаю!* Каждый герой сначала закрывает свои квесты в реале, а потом мы вместе идём бить монстров!\n" + statusLine,
+		"🦉 *Мудрая сова из архива ухает:* «Четверо смелых плюс Мастер — и можно выдвигаться! Осталось совсем чуть-чуть поднажать!»\n" + statusLine,
+		"🔥 *Подбросил дровишек в наш походный костёр!* Садитесь поближе, грейтесь — как только наберём минимальный отряд, трублю общий сбор!\n" + statusLine,
+		"🎲 *Кубики в мешочке уже нетерпеливо позвякивают!* Ждём ещё пару смельчаков в опрос, чтобы открыть новую главу хроники!\n" + statusLine,
+		"🤗 *Обнимаю всех пергаментными крыльями!* Дела есть дела, главное — не забывайте тыкнуть в опрос, как только появится минутка!\n" + statusLine,
+		"📖 *Держу закладку в летописи на свежей странице!* Как только наберём нужный состав — сразу впишем туда новые подвиги!\n" + statusLine,
+		"🌟 *Не набрались за этот час — наберёмся чуть позже!* Летописец никуда не уходит, свитки и казна под надёжной охраной.\n" + statusLine,
+		"🐾 *Топ-топ лапками по столу...* Кто там ещё прячется в кустах и не проголосовал? Выходите к костру, без вас не начинаем!\n" + statusLine,
+		"🐈‍⬛ *Потёрся усом о карту мира.* Нас пока маловато для великого похода, но я верю: остальные герои вот-вот выйдут из тумана войны!\n" + statusLine,
+		"⛺ *Палатки разбиты, котелок на огне, осталось дождаться подкрепления!* Не унываем, отряд — каждый голос приближает нас к старту!\n" + statusLine,
+		"🎺 *Тихонько дунул в походный горн, чтобы не разбудить дракона раньше времени.* Подтягивайтесь в опрос, смельчаки!\n" + statusLine,
+		"🍯 *Заварил чабрец с мёдом для тех, кто уже в строю!* Остальным выписываю повестку в архив — ждём вашего решения!\n" + statusLine,
+		"🧭 *Стрелка компаса дрожит в ожидании!* Как только нас станет четверо плюс Мастер — сразу выдвигаемся навстречу приключениям!\n" + statusLine,
+		"🐾 *Мягко прошёлся лапками по краю ширмы.* Мастер уже точит карандаши, осталось добрать совсем немного отважных душ!\n" + statusLine,
+		"🍻 *Трактирщик в «Хромом грифоне» уже натирает кружки в ожидании нашей компании!* Не подведите, герои — отмечайтесь в опросе!\n" + statusLine,
+		"📖 *Перечитал прошлую главу хроники — аж мурашки по пергаменту!* Очень хочется продолжить, так что ждём остальных в строй!\n" + statusLine,
+		"🦊 *Хитрый лис из лесов Ростланда подсказывает, что опаздывающие уже спешат к костру!* Не вешаем нос, скоро соберёмся!\n" + statusLine,
+		"🕯️ *Подкрутил фитиль свечи поярче, чтобы заблудившиеся путники быстрее нашли дорогу в чат!* Голосуем, не стесняемся!\n" + statusLine,
+		"⚔️ *Мечи наточены, зелья пересчитаны, не хватает только пары верных клинков в авангарде!* Ждём соратников!\n" + statusLine,
+		"🐈‍⬛ *Свернулся калачиком на сундуке с лутом.* Посторожу ваши сокровища, пока остальные добираются до голосования!\n" + statusLine,
+		"🌤️ *Тучи над Украденными землями понемногу расходятся!* Уверен, что скоро и наш отряд соберётся в полном боевом составе!\n" + statusLine,
+		"🎭 *Бард уже настроил лютню и репетирует вступление к новой балладе!* Осталось дождаться зрителей и главных действующих лиц!\n" + statusLine,
+		"🦉 *Сова из-под потолка архива ухнула ободряюще:* «Терпение, путники! Великие походы не терпят суеты!»\n" + statusLine,
+		"🍀 *Подул на наши счастливые двадцатигранники, чтобы они приманили в чат недостающих игроков!* Всё получится!\n" + statusLine,
+		"📜 *Оставил в ведомости свободные строчки для тех, кто ещё не отметился!* Перо наготове, чернила не сохнут!\n" + statusLine,
+		"🐾 *Выглянул из-за стопки древних фолиантов:* Ау-у, герои! Без вас даже гоблины в подземелье заскучали!\n" + statusLine,
+		"🔥 *Подбросил сухих веток в очаг — искры полетели до самых звёзд!* Подаём сигнал всем, кто ещё не проголосовал!\n" + statusLine,
+		"🛡️ *Щит к щиту, плечом к плечу — но сначала нужно набрать хотя бы четвёрку смелых!* Не унываем, мы уже близко!\n" + statusLine,
+		"🐈‍⬛ *Мур-р-р!* Настоящие искатели приключений умеют и дракона завалить, и товарищей с работы подождать!\n" + statusLine,
+		"🎒 *Проверил походные пайки — на всех хватит с запасом!* Осталось только дождаться, когда подтянутся остальные едоки!\n" + statusLine,
+		"🌌 *Звёзды над Голарионом выстраиваются в удачное созвездие!* Ещё пара голосов — и можно открывать портал в приключение!\n" + statusLine,
+		"🗝️ *Ключ от следующей главы уже в замке, осталось провернуть его дружными усилиями!* Ждём недостающих участников!\n" + statusLine,
+		"🐾 *Постучал когтем по чернильнице:* Тук-тук! Кто ещё не определился с планами — загляните в опрос!\n" + statusLine,
+		"🏰 *В столице королевства уже заждались вестей от нашего отряда!* Подтягивайтесь, друзья, без вас история стоит на паузе!\n" + statusLine,
+		"🧙‍♂️ *Магический шар слегка затуманился, но ясно показывает: подкрепление уже на подходе!* Держим боевой дух!\n" + statusLine,
+		"🍞 *Свежий хлеб и жареный кабан остывают на столе!* Ну же, герои, отмечайтесь в голосовании, пока всё не съели!\n" + statusLine,
+		"🐈‍⬛ *Лениво потянулся на свитках.* Я никуда не тороплюсь, у кота девять жизней — дождёмся всех нужных бойцов!\n" + statusLine,
+		"🎶 *Тихий перебор струн у костра напоминает: лучшие вечера всегда начинаются с дружного сбора отряда!*\n" + statusLine,
+		"🏹 *Стрелы в колчане, тетива натянута, не хватает только пары глаз в дозоре!* Ждём остальных героев!\n" + statusLine,
+		"📜 *В моей книге написано: «Тот, кто умеет ждать, всегда забирает самые жирные трофеи»!* Не расстраиваемся!\n" + statusLine,
+		"🐾 *Пробежался по карте от столицы до самых топей — везде тихо, все ждут нашего возвращения!* Голосуем активнее!\n" + statusLine,
+		"🌟 *Даже если сегодня собираемся не так быстро, как хотелось бы, наша команда всё равно лучшая в Ростланде!*\n" + statusLine,
+		"🕯️ *Пламя свечи танцует на сквозняке — это ветер перемен несёт к нам недостающих игроков!*\n" + statusLine,
+		"🐈‍⬛ *Прижал уши и прислушался:* Кажется, вдалеке уже слышен звон доспехов спешащих на помощь товарищей!\n" + statusLine,
+		"🎲 *D20 перекатился с единицы на девятнадцать — хороший знак!* Скоро кворум обязательно соберётся!\n" + statusLine,
+		"🌲 *Лесные духи шепчут, что к вечеру отряд непременно укомплектуется!* Не вешаем нос, искатели!\n" + statusLine,
+		"💼 *Реальный мир — босс коварный, но мы верим, что наши герои скоро вырвутся из его лап прямо к игровому столу!*\n" + statusLine,
+		"🐾 *Поскрёб лапкой по краю пергамента:* Эй, партия, не теряемся! До минимального состава осталось совсем чуть-чуть!\n" + statusLine,
+		"🏆 *Великие свершения требуют тщательной подготовки!* Ждём, пока все освободятся и нажмут заветную кнопку!\n" + statusLine,
+		"🐈‍⬛ *Сверкнул глазами из полумрака архива:* Я всё вижу — кто ещё не проголосовал, тому выпишу штраф в виде дежурства у костра!\n" + statusLine,
+		"🫖 *Чайник вскипел уже по второму кругу — самое время заглянуть в чат и отметиться в сборе отряда!*\n" + statusLine,
+		"🗺️ *Белые пятна на карте сами себя не исследуют, но втроём туда лезть опасно!* Ждём четвёртого смельчака!\n" + statusLine,
+		"✨ *Никакого уныния в рядах!* Каждая пауза лишь делает нашу следующую встречу ещё более долгожданной!\n" + statusLine,
+		"🐾 *Устроился поудобнее на подушке.* Слежу за счётчиком голосов в оба глаза — вот-вот доберём нужный состав!\n" + statusLine,
+		"📯 *Ещё один короткий сигнал сбора для тех, кто закрутился в делах!* Отряд ждёт именно тебя!\n" + statusLine,
+		"📜 *Свиток приключений развёрнут ровно наполовину — допишите свои имена в список участников опроса!*\n" + statusLine,
+		"🐈‍⬛ *Мяу-поддержка в действии!* Не переживайте, если пока не набрались — впереди ещё куча времени отметиться!\n" + statusLine,
+		"🌅 *Любой большой поход начинается с первого шага и четырёх подтвердивших участие героев!* Поднажмём!\n" + statusLine,
+	}
+	return replies[rand.Intn(len(replies))]
+}
+
+func (h *BotHandler) handleStickerMessage(c tele.Context) error {
+	st := c.Message().Sticker
+	if st == nil || st.SetName != "D_an_D" {
+		return nil
+	}
+
+	chatID := c.Chat().ID
+	if _, isMuted := h.mutedChats.Load(chatID); isMuted {
+		return nil
+	}
+
+	// Защита от спама при обмене стикерами (кулдаун 20 сек на чат)
+	if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
+		if time.Since(lastVal.(time.Time)) < 20*time.Second {
+			return nil
+		}
+	}
+	h.lastMentionReply.Store(chatID, time.Now())
+
+	tgID := c.Sender().ID
+	speakerName := c.Sender().FirstName
+	if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+		speakerName = domain.GetStr(hero.Data, "name", speakerName)
+	}
+
+	replies := []string{
+		fmt.Sprintf("🐾 *Выглянул из-за ширмы на художество %s!* О-о-о, вот это я понимаю — настоящая классика подземелий и драконов!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Потыкал мягкой лапкой в стикер от %s.* Мур-р-р, прямо как иллюстрация из старинного бестиария Авессалома!", speakerName),
+		fmt.Sprintf("📜 *Бережно вклеиваю этот шедевр от %s в летопись отряда!* Пусть потомки видят, какие страсти кипели у костра!", speakerName),
+		fmt.Sprintf("🎲 *Закатил d20 под ширму от такого стикера, %s!* Настрой у партии явно на двадцатку!", speakerName),
+		fmt.Sprintf("👀 *Прищурил жёлтые глаза на картинку %s.* До боли знакомая сцена... Это мы в прошлом подземелье так выглядели?", speakerName),
+		fmt.Sprintf("🪶 *Поправил невидимые очки на носу:* Та-а-ак, *%s*, в раздел «Наскальная живопись авантюристов» прибыло!", speakerName),
+		fmt.Sprintf("🕯️ *Подтащил свечу поближе к стикеру %s...* Осторожно, чуть усы не опалил, но картинка того стоила!", speakerName),
+		fmt.Sprintf("🎭 *Бард в углу аж лютню отложил, глядя на стикер %s!* Вот это я понимаю — выразительность без лишних слов!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Свернулся калачиком рядом со стикером %s.* Душевный рисунок, одобряю всеми четырьмя лапами!", speakerName),
+		fmt.Sprintf("📖 *Перелистал гримуар:* Хм, *%s*, заклинание вызова таких картинок явно требует как минимум третий круг магии!", speakerName),
+		fmt.Sprintf("✨ *Дзынь!* Сургучная печать архива ставится на этот стикер от *%s* без малейших колебаний!", speakerName),
+		fmt.Sprintf("😼 *%s*, признайся, ты этот стикерпак специально в походном поясе быстрого доступа таскаешь?", speakerName),
+		fmt.Sprintf("🐾 *Поскрёб когтем по рамке стикера %s.* Красивое! Сбрасывать со стола не буду, так и быть.", speakerName),
+		fmt.Sprintf("🔥 *Подбросил полешко в костёр!* С такими иллюстрациями от *%s* у нас в чате всегда атмосфера лучшей таверны!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Уши на макушке, хвост трубой!* Береста приветствует истинный приключенческий дух от *%s*!", speakerName),
+		fmt.Sprintf("📜 *Записал в протокол:* «*%s* выразил боевой настрой отряда языком древних пиктограмм».", speakerName),
+		fmt.Sprintf("🍻 *Поднимаю кружку виртуального эля за стикер от %s!* В самое яблочко!", speakerName),
+		fmt.Sprintf("🧙‍♂️ *Задумчиво погладил ус, глядя на рисунок %s.* Чувствую, в этой картинке скрыт глубокий тактический замысел!", speakerName),
+		fmt.Sprintf("🐾 *Топ-топ лапками по карте мира...* Прибежал полюбоваться на стикер от *%s*. Годно, очень годно!", speakerName),
+		fmt.Sprintf("🎨 *Художники королевского двора обзавидовались бы, %s!* Выписываю премию в виде внеочередного «Мяу одобрения»!", speakerName),
+		fmt.Sprintf("⚔️ *Звон мечей, треск факелов и этот стикер от %s* — вот ради чего мы все здесь и собрались!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Потёрся щекой о стикер %s.* Люблю, когда в чате пахнет настоящими приключениями!", speakerName),
+		fmt.Sprintf("🔮 *Поглядел на картинку %s сквозь граненый d20...* Похоже, сегодня нас ждёт весёлая сессия!", speakerName),
+		fmt.Sprintf("📚 *Положил стикер %s на самую почётную полку архива* — рядом с картой сокровищ и рецептом эля!", speakerName),
+		fmt.Sprintf("😏 *%s*, у тебя на каждый критический провал и великий триумф свой рисунок припасён?", speakerName),
+		fmt.Sprintf("🦉 *Мудрая сова в углу архива одобрительно ухнула на стикер %s!* В точку!", speakerName),
+		fmt.Sprintf("🐾 *Прошёл мягкими лапками по краю стикера %s* — оставил свои следы на память!", speakerName),
+		fmt.Sprintf("🎪 *Ну всё, %s, с таким стикером можно смело открывать передвижной театр в Ростланде!*", speakerName),
+		fmt.Sprintf("🕯️ *При свете свечи этот стикер от %s выглядит ещё эпичнее!* Заношу в анналы!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Выглянул из сундука с трофеями на шум от %s:* Ого, да тут целая картина маслом!", speakerName),
+		fmt.Sprintf("🗡️ *Даже старый клинок в ножнах зазвенел от такого стикера, %s!*", speakerName),
+		fmt.Sprintf("📖 *Закладку в хронике поставил прямо на этом шедевре от %s!* Непотеряемая классика.", speakerName),
+		fmt.Sprintf("🐾 *Привстал на задние лапки, разглядывая стикер %s.* Вот это уровень отыгрыша!", speakerName),
+		fmt.Sprintf("🌟 *Блестяще, %s!* Такой стикер добавляет +2 к морали всего отряда до конца дня!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Мяу! Посмотрел на стикер %s и сразу вспомнил наши лучшие походы по Украденным землям!*", speakerName),
+		fmt.Sprintf("✒️ *Макнул перо в золотые чернила:* Надо бы описать этот шедевр от *%s* в следующей главе!", speakerName),
+		fmt.Sprintf("🎲 *Если бы за стикеры кидали инициативу, %s только что выкинул натуральную двадцатку!*", speakerName),
+		fmt.Sprintf("🏕️ *У нашего походного костра стало ещё уютнее благодаря картинке от %s!*", speakerName),
+		fmt.Sprintf("😼 *Хм-м-м, %s...* Этот стикер подозрительно точно описывает текущее состояние нашей партии!", speakerName),
+		fmt.Sprintf("🐾 *Пошевелил чёрными ушами:* Одобряю вкус *%s* в наскальной живописи!", speakerName),
+		fmt.Sprintf("📜 *Свитки зашуршали от восторга, глядя на стикер %s!* Продолжайте в том же духе!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Сверкнул жёлтыми глазами из-за ширмы:* О-о-о, тяжёлая артиллерия стикеров от *%s* пошла в ход!", speakerName),
+		fmt.Sprintf("🛡️ *С таким боевым настроем от %s нам ни один дракон не страшен!*", speakerName),
+		fmt.Sprintf("🍯 *За такой душевный стикер, %s, коту-летописцу полагается двойная порция сметаны!*", speakerName),
+		fmt.Sprintf("👀 *Смотрю в оба глаза на художество %s* — ни одна деталь мимо архивариуса не проскочит!", speakerName),
+		fmt.Sprintf("🎶 *В трактирах столицы скоро будут петь баллады об этом стикере от %s!*", speakerName),
+		fmt.Sprintf("🐾 *Мягко прыгнул на стол поближе к стикеру %s.* Красота да и только!", speakerName),
+		fmt.Sprintf("🧭 *Компас приключений указывает прямо на %s!* Отличный выбор иллюстрации!", speakerName),
+		fmt.Sprintf("🐈‍⬛ *Мур-р-р!* Люблю, когда герои общаются на языке настоящих настольщиков, *%s*!", speakerName),
+		fmt.Sprintf("🏆 *Вручаю %s почётный кубок «Мастер иллюстраций текущего привала»!*", speakerName),
+	}
+
+	reply := replies[rand.Intn(len(replies))]
+	return c.Reply(reply, tele.ModeMarkdown)
+}
+
+// handleTrackPollCommand позволяет админу подцепить уже существующий опрос ответом (reply) на него
+func (h *BotHandler) handleTrackPollCommand(c tele.Context) error {
+	if !IsAdmin(c.Sender().ID) {
+		return nil
+	}
+
+	replyMsg := c.Message().ReplyTo
+	if replyMsg == nil || replyMsg.Poll == nil {
+		return c.Reply("⚠️ Ответьте (Reply) этой командой на уже запущенный опрос бота, чтобы поставить его на отслеживание.")
+	}
+
+	if replyMsg.Poll.Closed {
+		return c.Reply("⚠️ Этот опрос уже закрыт.")
+	}
+
+	// Удаляем служебную команду админа, чтобы не засорять чат
+	_ = c.Delete()
+
+	// Запускаем стандартный цикл проверок (1 час -> каждые 4 часа -> закрытие через 24 часа)
+	h.schedulePollCheck(c.Bot(), replyMsg, 1*time.Hour)
+
+	return c.Send("🐾 *Береста взял это голосование под наблюдение!* Проверю явку через 1 час и подведу итоги через 24 часа.", tele.ModeMarkdown)
 }
