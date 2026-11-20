@@ -15,6 +15,7 @@ func FormatPage1(h *domain.HeroRecord) string {
 	ancestry := domain.GetStr(s, "ancestry", "")
 	heritage := domain.GetStr(s, "heritage", "")
 	background := domain.GetStr(s, "background", "")
+	backgroundFeat := domain.GetStr(s, "backgroundFeat", "")
 	charClass := domain.GetStr(s, "charClass", "")
 	alignment := domain.GetStr(s, "alignment", "")
 	lvl := domain.GetInt(s, "level", 1)
@@ -40,7 +41,11 @@ func FormatPage1(h *domain.HeroRecord) string {
 		sb.WriteString(fmt.Sprintf("_%s_\n", strings.Join(bioParts, " • ")))
 	}
 	if background != "" {
-		sb.WriteString(fmt.Sprintf("📜 Происхождение: _%s_\n", background))
+		if backgroundFeat != "" {
+			sb.WriteString(fmt.Sprintf("📜 Происхождение: _%s_ (%s)\n", background, backgroundFeat))
+		} else {
+			sb.WriteString(fmt.Sprintf("📜 Происхождение: _%s_\n", background))
+		}
 	}
 	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 
@@ -109,6 +114,40 @@ func FormatPage1(h *domain.HeroRecord) string {
 		sb.WriteString(strings.Join(weaponLines, "\n") + "\n")
 	}
 
+	var actionSlots []string
+	for i := 1; i <= 3; i++ {
+		if aName := domain.GetStr(s, fmt.Sprintf("actionSlot%dName", i), ""); aName != "" {
+			actionSlots = append(actionSlots, aName)
+		}
+	}
+	if len(actionSlots) > 0 {
+		sb.WriteString(fmt.Sprintf("\n⚡ *Боевые действия:* %s\n", strings.Join(actionSlots, " • ")))
+	}
+
+	ancFeats := collectFeats(s, "ancFeatLvl", []int{1, 5, 9, 13, 17})
+	if legacyAnc := domain.GetStr(s, "ancestryFeat", ""); legacyAnc != "" && len(ancFeats) == 0 {
+		ancFeats = append(ancFeats, legacyAnc)
+	}
+	classFeats := collectFeats(s, "classFeatLvl", []int{1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20})
+	genFeats := collectFeats(s, "genFeatLvl", []int{3, 7, 11, 15, 19})
+	skillFeats := collectFeats(s, "skillFeatLvl", []int{2, 4, 6, 8, 10, 12, 14, 16, 18, 20})
+
+	if len(ancFeats) > 0 || len(classFeats) > 0 || len(genFeats) > 0 || len(skillFeats) > 0 {
+		sb.WriteString("\n🏅 *Черты персонажа:*\n")
+		if len(ancFeats) > 0 {
+			sb.WriteString(fmt.Sprintf("🧬 _Народа:_ %s\n", strings.Join(ancFeats, ", ")))
+		}
+		if len(classFeats) > 0 {
+			sb.WriteString(fmt.Sprintf("⚔️ _Классовые:_ %s\n", strings.Join(classFeats, ", ")))
+		}
+		if len(genFeats) > 0 {
+			sb.WriteString(fmt.Sprintf("🌟 _Общие:_ %s\n", strings.Join(genFeats, ", ")))
+		}
+		if len(skillFeats) > 0 {
+			sb.WriteString(fmt.Sprintf("📖 _Навыков:_ %s\n", strings.Join(skillFeats, ", ")))
+		}
+	}
+
 	skillsList := []struct{ key, title string }{
 		{"acrobatics", "Акробатика"}, {"athletics", "Атлетика"}, {"thievery", "Воровство"},
 		{"survival", "Выживание"}, {"diplomacy", "Дипломатия"}, {"intimidation", "Запугивание"},
@@ -151,6 +190,16 @@ func FormatPage1(h *domain.HeroRecord) string {
 	}
 
 	return sb.String()
+}
+
+func collectFeats(s map[string]any, prefix string, levels []int) []string {
+	var out []string
+	for _, lvl := range levels {
+		if fName := domain.GetStr(s, fmt.Sprintf("%s%dName", prefix, lvl), ""); fName != "" {
+			out = append(out, fmt.Sprintf("%s _(%d ур.)_", fName, lvl))
+		}
+	}
+	return out
 }
 
 func FormatPage2(h *domain.HeroRecord) string {
