@@ -231,6 +231,17 @@ func (r *HeroRepository) TransferItem(ctx context.Context, senderTgID int64, slo
 		recStats[destNotesKey] = itemNotes
 	}
 
+	senderName := domain.GetStr(senderData, "name", "Герой")
+	recName := domain.GetStr(recData, "name", "Союзник")
+
+	pushGmToastToHeroData(
+		senderData,
+		"tg_give",
+		fmt.Sprintf("🎁 <b>%s</b> → <b>%s</b> (TG): <b style=\"color:#74b9ff;\">%s</b> (×%d)",
+			html.EscapeString(senderName), html.EscapeString(recName), html.EscapeString(itemName), moveQty),
+		"#74b9ff",
+	)
+
 	newSenderBytes, _ := json.Marshal(senderData)
 	newRecBytes, _ := json.Marshal(recData)
 
@@ -246,8 +257,6 @@ func (r *HeroRepository) TransferItem(ctx context.Context, senderTgID int64, slo
 		return nil, err
 	}
 
-	senderName := domain.GetStr(senderData, "name", "Герой")
-	recName := domain.GetStr(recData, "name", "Союзник")
 	appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🎁 [TG] %s → %s: %s (×%d)", senderName, recName, itemName, moveQty))
 
 	if err := tx.Commit(ctx); err != nil {
@@ -363,6 +372,29 @@ func (r *HeroRepository) TransferCoins(ctx context.Context, senderTgID int64, re
 	recStats["coinsSilver"] = domain.GetInt(recStats, "coinsSilver", 0) + silver
 	recStats["coinsCopper"] = domain.GetInt(recStats, "coinsCopper", 0) + copper
 
+	senderName := domain.GetStr(senderData, "name", "Герой")
+	recName := domain.GetStr(recData, "name", "Союзник")
+
+	var coinParts []string
+	if gold > 0 {
+		coinParts = append(coinParts, fmt.Sprintf("%d ЗМ", gold))
+	}
+	if silver > 0 {
+		coinParts = append(coinParts, fmt.Sprintf("%d СМ", silver))
+	}
+	if copper > 0 {
+		coinParts = append(coinParts, fmt.Sprintf("%d ММ", copper))
+	}
+	coinsLabel := strings.Join(coinParts, " ")
+
+	pushGmToastToHeroData(
+		senderData,
+		"tg_pay",
+		fmt.Sprintf("💸 <b>%s</b> → <b>%s</b> (TG): <b style=\"color:#ffd875;\">%s</b>",
+			html.EscapeString(senderName), html.EscapeString(recName), html.EscapeString(coinsLabel)),
+		"#ffd875",
+	)
+
 	newSenderBytes, _ := json.Marshal(senderData)
 	newRecBytes, _ := json.Marshal(recData)
 
@@ -378,8 +410,6 @@ func (r *HeroRepository) TransferCoins(ctx context.Context, senderTgID int64, re
 		return nil, err
 	}
 
-	senderName := domain.GetStr(senderData, "name", "Герой")
-	recName := domain.GetStr(recData, "name", "Союзник")
 	appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("💸 [TG] %s → %s: %d ЗМ %d СМ %d ММ", senderName, recName, gold, silver, copper))
 
 	if err := tx.Commit(ctx); err != nil {
@@ -518,7 +548,17 @@ func (r *HeroRepository) UnequipGear(ctx context.Context, tgID int64, gearType s
 	}
 
 	newAC := recalcSheetAC(stats)
+	heroName := domain.GetStr(hero.Data, "name", "Герой")
+	pushGmToastToHeroData(
+		hero.Data,
+		"tg_unequip",
+		fmt.Sprintf("⬇️ <b>%s</b> снял (TG): <b style=\"color:#a4b0be;\">%s</b> (КБ: <b>%d</b>)",
+			html.EscapeString(heroName), html.EscapeString(removedName), newAC),
+		"#a4b0be",
+	)
+
 	if err := r.saveHeroData(ctx, hero.ID, hero.Data); err != nil {
+
 		return "", 0, err
 	}
 	return removedName, newAC, nil
@@ -709,7 +749,17 @@ func (r *HeroRepository) EquipFromBackpack(ctx context.Context, tgID int64, slot
 	}
 
 	newAC := recalcSheetAC(stats)
+	heroName := domain.GetStr(hero.Data, "name", "Герой")
+	pushGmToastToHeroData(
+		hero.Data,
+		"tg_equip",
+		fmt.Sprintf("⬆️ <b>%s</b> надел / взял (TG): <b style=\"color:#2ecc71;\">%s</b> (КБ: <b>%d</b>)",
+			html.EscapeString(heroName), html.EscapeString(itemName), newAC),
+		"#2ecc71",
+	)
+
 	if err := r.saveHeroData(ctx, hero.ID, hero.Data); err != nil {
+
 		return "", 0, err
 	}
 	return itemName, newAC, nil
