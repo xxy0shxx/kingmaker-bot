@@ -48,6 +48,7 @@ type BotHandler struct {
 	lastMentionReply          sync.Map
 	mutedChats                sync.Map
 	activePolls               sync.Map
+	activeRiddles             sync.Map
 }
 
 func NewBotHandler(repo *repository.HeroRepository, gear *catalog.GearStore, compendium *catalog.CompendiumStore) *BotHandler {
@@ -168,6 +169,9 @@ func (h *BotHandler) Register(b *tele.Bot) {
 	b.Handle("/action", h.handleActionLookupCommand)
 	b.Handle(&tele.Btn{Unique: "comp_view"}, h.handleCompendiumViewCallback)
 
+	b.Handle(&tele.Btn{Unique: "rid_ans"}, h.handleRiddleAnswerCallback)
+	b.Handle(&tele.Btn{Unique: "rid_rev"}, h.handleRiddleRevealCallback)
+
 	b.Handle(&tele.Btn{Unique: "tr_item"}, h.handleSelectRecipient)
 	b.Handle(&tele.Btn{Unique: "tr_to"}, h.handleSelectQtyOrSend)
 	b.Handle(&tele.Btn{Unique: "tr_exec"}, h.handleExecuteTransfer)
@@ -193,6 +197,7 @@ func (h *BotHandler) Register(b *tele.Bot) {
 		}
 		return nil
 	})
+	h.startDailyRiddleScheduler(b)
 }
 
 func (h *BotHandler) handleWebAccess(c tele.Context) error {
@@ -724,6 +729,26 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 		return nil
 	}
 
+	if taggedUser, hasTag := extractTaggedUserMention(c); hasTag {
+		if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
+			if time.Since(lastVal.(time.Time)) < 20*time.Second {
+				return nil
+			}
+		}
+		h.lastMentionReply.Store(chatID, time.Now())
+
+		speakerName := c.Sender().FirstName
+		if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+			speakerName = domain.GetStr(hero.Data, "name", speakerName)
+		}
+
+		reply := buildUserTagReply(taggedUser, speakerName, text)
+		if err := c.Reply(reply, tele.ModeMarkdown); err != nil {
+			return c.Reply(strings.ReplaceAll(reply, "*", ""))
+		}
+		return nil
+	}
+
 	if mentionedHero, isCompanion, found := h.findMentionedHero(context.Background(), c, text); found {
 		chatID := c.Chat().ID
 		if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
@@ -747,6 +772,37 @@ func (h *BotHandler) handleTextMessage(c tele.Context) error {
 
 		if err := c.Reply(reply, tele.ModeMarkdown); err != nil {
 			return c.Reply(strings.ReplaceAll(reply, "*", ""))
+		}
+		return nil
+	}
+
+	speakerName := c.Sender().FirstName
+	if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+		speakerName = domain.GetStr(hero.Data, "name", speakerName)
+	}
+
+	var ambientReply string
+	switch {
+	case isPartyStatusMessage(text):
+		ambientReply = buildPartyAttendanceReply(text, speakerName)
+	case isCombatPanicMessage(text):
+		ambientReply = buildCombatPanicReply(speakerName)
+	case isLootDisputeMessage(text):
+		ambientReply = buildLootDisputeReply(speakerName)
+	case isRulesDebateMessage(text):
+		ambientReply = buildRulesDebateReply(speakerName)
+	}
+
+	if ambientReply != "" {
+		if lastVal, exists := h.lastMentionReply.Load(chatID); exists {
+			if time.Since(lastVal.(time.Time)) < 30*time.Second {
+				return nil
+			}
+		}
+		h.lastMentionReply.Store(chatID, time.Now())
+
+		if err := c.Reply(ambientReply, tele.ModeMarkdown); err != nil {
+			return c.Reply(strings.ReplaceAll(ambientReply, "*", ""))
 		}
 		return nil
 	}
@@ -2229,6 +2285,77 @@ func matchesEntityName(words []string, rawName string) bool {
 	return false
 }
 
+var classAliasesMap = []struct {
+	Canonical string
+	Triggers  []string
+}{
+	{"жрец", []string{"жрец", "жриц", "прист", "клирик", "клерик", "хил", "лекар", "священник", "cleric", "priest"}},
+	{"поборник", []string{"поборник", "паладин", "защитник", "чемпион", "champion", "paladin"}},
+	{"бард", []string{"бард", "менестрел", "певец", "скальд", "bard"}},
+	{"монах", []string{"монах", "монашк", "котолюд", "monk"}},
+	{"следопыт", []string{"следопыт", "рейнджер", "охотник", "лучник", "ranger"}},
+	{"варвар", []string{"варвар", "берсерк", "дикарь", "barbarian"}},
+	{"чародей", []string{"чародей", "сорк", "сорц", "колдун", "sorcerer"}},
+	{"волшебник", []string{"волшебник", "маг", "визард", "wizard"}},
+	{"воин", []string{"воин", "файтер", "боец", "мечник", "fighter"}},
+	{"плут", []string{"плут", "вор", "рога", "разбойник", "rogue"}},
+	{"друид", []string{"друид", "druid"}},
+	{"ведьма", []string{"ведьма", "ведьмак", "witch"}},
+}
+
+func matchesHeroClass(words []string, rawClass string) bool {
+	cleanClass := strings.ToLower(strings.ReplaceAll(rawClass, "ё", "е"))
+	if cleanClass == "" {
+		return false
+	}
+
+	for _, entry := range classAliasesMap {
+		if !strings.Contains(cleanClass, entry.Canonical) {
+			continue
+		}
+		for _, w := range words {
+			for _, trig := range entry.Triggers {
+				if strings.HasPrefix(w, trig) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func extractTaggedUserMention(c tele.Context) (string, bool) {
+	msg := c.Message()
+	if msg == nil || len(msg.Entities) == 0 {
+		return "", false
+	}
+
+	botUsername := ""
+	if c.Bot() != nil && c.Bot().Me != nil {
+		botUsername = strings.ToLower(c.Bot().Me.Username)
+	}
+
+	runes := []rune(msg.Text)
+	for _, ent := range msg.Entities {
+		if ent.Type == tele.EntityMention {
+			if ent.Offset >= 0 && ent.Offset+ent.Length <= len(runes) {
+				mention := string(runes[ent.Offset : ent.Offset+ent.Length])
+				if botUsername != "" && strings.EqualFold(strings.TrimPrefix(mention, "@"), botUsername) {
+					continue
+				}
+				return mention, true
+			}
+		}
+		if ent.Type == tele.EntityTMention && ent.User != nil && !ent.User.IsBot {
+			if ent.User.Username != "" {
+				return "@" + ent.User.Username, true
+			}
+			return ent.User.FirstName, true
+		}
+	}
+	return "", false
+}
+
 func (h *BotHandler) findMentionedHero(ctx context.Context, c tele.Context, text string) (*domain.HeroRecord, bool, bool) {
 	heroes, err := h.repo.GetRoomActiveHeroes(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
 	if err != nil || len(heroes) == 0 {
@@ -2255,6 +2382,15 @@ func (h *BotHandler) findMentionedHero(ctx context.Context, c tele.Context, text
 		compName := domain.GetStr(st, "compName", "")
 		if (compType != "none" || compName != "") && matchesEntityName(words, compName) {
 			return &heroes[i], true, true
+		}
+	}
+
+	// 3. Проверяем упоминание по классу / игровой роли («прист», «жрец», «бард», «монах» и т.д.)
+	for i := range heroes {
+		st := heroes[i].Stats()
+		charClass := domain.GetStr(st, "charClass", "")
+		if matchesHeroClass(words, charClass) {
+			return &heroes[i], false, true
 		}
 	}
 
@@ -3268,4 +3404,231 @@ func (h *BotHandler) handleCompendiumCategoryCallback(c tele.Context) error {
 		inline,
 		tele.ModeHTML,
 	)
+}
+
+// --- Загадки у костра (/riddle) ---
+
+type activeRiddleState struct {
+	Riddle     RiddleItem
+	Solved     bool
+	WinnerName string
+	Attempted  map[int64]bool
+	mu         sync.Mutex
+}
+
+func (h *BotHandler) handleRiddleAnswerCallback(c tele.Context) error {
+	ridKey, optIdxStr, ok := strings.Cut(c.Callback().Data, "|")
+	if !ok {
+		_ = c.Respond(&tele.CallbackResponse{Text: "Ошибка кнопки."})
+		return nil
+	}
+	optIdx, _ := strconv.Atoi(optIdxStr)
+
+	val, exists := h.activeRiddles.Load(ridKey)
+	if !exists {
+		_ = c.Respond(&tele.CallbackResponse{Text: "⏳ Эта загадка уже ушла в архив! Запустите новую через /riddle.", ShowAlert: true})
+		return nil
+	}
+
+	st := val.(*activeRiddleState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.Solved {
+		_ = c.Respond(&tele.CallbackResponse{
+			Text:      fmt.Sprintf("🏆 Загадку уже отгадал(а) %s!", st.WinnerName),
+			ShowAlert: true,
+		})
+		return nil
+	}
+
+	tgID := c.Sender().ID
+	if st.Attempted[tgID] {
+		_ = c.Respond(&tele.CallbackResponse{
+			Text:      "😼 Эй, у каждого героя только одна попытка на загадку!",
+			ShowAlert: true,
+		})
+		return nil
+	}
+	st.Attempted[tgID] = true
+
+	speakerName := c.Sender().FirstName
+	if hero, err := h.repo.GetHeroByTgID(context.Background(), tgID); err == nil {
+		speakerName = domain.GetStr(hero.Data, "name", speakerName)
+	}
+
+	if optIdx == st.Riddle.Correct {
+		st.Solved = true
+		st.WinnerName = speakerName
+		_ = c.Respond(&tele.CallbackResponse{Text: "🌟 Верно! Натуральная двадцатка на проверку Знаний!"})
+
+		solvedText := fmt.Sprintf(
+			"🕯️ <b>Загадка у походного костра — РАЗГАДАНА!</b>\n"+
+				"━━━━━━━━━━━━━━━━━━━━\n"+
+				"📜 <i>«%s»</i>\n\n"+
+				"✅ <b>Правильный ответ:</b> <code>%s</code>\n"+
+				"🏆 <b>Знаток костра:</b> <b>%s</b>!\n"+
+				"🐾 <i>Береста торжественно поправляет невидимые очки и вносит имя победителя в свиток мудрецов!</i>",
+			html.EscapeString(st.Riddle.Question),
+			html.EscapeString(st.Riddle.Options[st.Riddle.Correct]),
+			html.EscapeString(speakerName),
+		)
+		return c.Edit(solvedText, tele.ModeHTML)
+	}
+
+	_ = c.Respond(&tele.CallbackResponse{
+		Text:      fmt.Sprintf("🐈‍⬛ Мимо, %s! Свитки шепчут, что это неверный ответ. Подсказка: %s", speakerName, st.Riddle.Hint),
+		ShowAlert: true,
+	})
+	return nil
+}
+
+func (h *BotHandler) handleRiddleRevealCallback(c tele.Context) error {
+	ridKey := strings.TrimSpace(c.Callback().Data)
+	val, exists := h.activeRiddles.Load(ridKey)
+	if !exists {
+		_ = c.Respond(&tele.CallbackResponse{Text: "⏳ Эта загадка уже закрыта."})
+		return nil
+	}
+
+	st := val.(*activeRiddleState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.Solved {
+		_ = c.Respond(&tele.CallbackResponse{Text: "Загадка уже закрыта."})
+		return nil
+	}
+
+	st.Solved = true
+	st.WinnerName = "Архив Бересты"
+	_ = c.Respond(&tele.CallbackResponse{Text: "📖 Свиток с отгадкой раскрыт!"})
+
+	speakerName := c.Sender().FirstName
+	if hero, err := h.repo.GetHeroByTgID(context.Background(), c.Sender().ID); err == nil {
+		speakerName = domain.GetStr(hero.Data, "name", speakerName)
+	}
+
+	revealText := fmt.Sprintf(
+		"🕯️ <b>Загадка у костра (ответ раскрыт)</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"📜 <i>«%s»</i>\n\n"+
+			"📖 <b>Разгадка:</b> <code>%s</code>\n"+
+			"💡 <i>%s</i>\n"+
+			"😼 <i>Печать тайны сорвал(а): %s.</i>",
+		html.EscapeString(st.Riddle.Question),
+		html.EscapeString(st.Riddle.Options[st.Riddle.Correct]),
+		html.EscapeString(st.Riddle.Hint),
+		html.EscapeString(speakerName),
+	)
+	return c.Edit(revealText, tele.ModeHTML)
+}
+
+// --- Спонтанная дневная загадка у костра (1 раз в день с 10:00 до 21:00 NSK) ---
+
+func (h *BotHandler) startDailyRiddleScheduler(b *tele.Bot) {
+	if b == nil {
+		return
+	}
+
+	go func() {
+		loc := time.FixedZone("NSK", 7*3600)
+		lastSentDateByChat := make(map[int64]string)
+		targetMinuteByChat := make(map[int64]int)
+
+		checkAndSend := func() {
+			now := time.Now().In(loc)
+			hour := now.Hour()
+
+			// Строго дневное окно: с 10:00 до 21:00 (ночью не беспокоим чат)
+			if hour < 10 || hour >= 21 {
+				return
+			}
+
+			todayKey := now.Format("2006-01-02")
+			currentMinute := hour*60 + now.Minute()
+
+			chatIDs, err := h.repo.GetActiveGroupChatIDs(context.Background())
+			if err != nil || len(chatIDs) == 0 {
+				return
+			}
+
+			for _, chatID := range chatIDs {
+				if _, isMuted := h.mutedChats.Load(chatID); isMuted {
+					continue
+				}
+				if lastSentDateByChat[chatID] == todayKey {
+					continue
+				}
+
+				targetMin, hasTarget := targetMinuteByChat[chatID]
+				if !hasTarget {
+					// Случайная минута между 10:30 (630) и 20:30 (1230)
+					offset := int(time.Now().UnixNano() % 600)
+					if offset < 0 {
+						offset = -offset
+					}
+					targetMin = 630 + offset
+					targetMinuteByChat[chatID] = targetMin
+				}
+
+				if currentMinute >= targetMin {
+					lastSentDateByChat[chatID] = todayKey
+					delete(targetMinuteByChat, chatID)
+					_ = h.sendRiddleToChat(b, chatID)
+				}
+			}
+		}
+
+		time.Sleep(1 * time.Minute)
+		checkAndSend()
+
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			checkAndSend()
+		}
+	}()
+}
+
+func (h *BotHandler) sendRiddleToChat(b *tele.Bot, chatID int64) error {
+	if b == nil || chatID == 0 || len(berestaRiddles) == 0 {
+		return nil
+	}
+
+	idx := int(time.Now().UnixNano() % int64(len(berestaRiddles)))
+	if idx < 0 {
+		idx = -idx
+	}
+	riddle := berestaRiddles[idx]
+	ridKey := fmt.Sprintf("r_%d_%d", chatID, time.Now().UnixNano())
+
+	h.activeRiddles.Store(ridKey, &activeRiddleState{
+		Riddle:    riddle,
+		Attempted: make(map[int64]bool),
+	})
+
+	time.AfterFunc(12*time.Hour, func() {
+		h.activeRiddles.Delete(ridKey)
+	})
+
+	inline := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	for i, opt := range riddle.Options {
+		btn := inline.Data(opt, "rid_ans", fmt.Sprintf("%s|%d", ridKey, i))
+		rows = append(rows, inline.Row(btn))
+	}
+	rows = append(rows, inline.Row(inline.Data("🔍 Подсмотреть разгадку", "rid_rev", ridKey)))
+	inline.Inline(rows...)
+
+	msg := fmt.Sprintf(
+		"🕯️ <b>Загадка дня у костра от Бересты</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━\n"+
+			"📜 <i>«%s»</i>\n\n"+
+			"🐾 <i>Кто первым даст верный ответ — получит почётный титул архивариуса!</i>",
+		html.EscapeString(riddle.Question),
+	)
+
+	_, err := b.Send(&tele.Chat{ID: chatID}, msg, inline, tele.ModeHTML)
+	return err
 }

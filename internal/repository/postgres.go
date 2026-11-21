@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -976,6 +978,15 @@ func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemNa
 	stats["coinsSilver"] = remS
 	stats["coinsCopper"] = remC
 
+	heroName := domain.GetStr(heroData, "name", "Герой")
+	pushGmToastToHeroData(
+		heroData,
+		"tg_buy",
+		fmt.Sprintf("🛒 <b>%s</b> купил в лавке (TG): <b style=\"color:#ffd875;\">%s</b> (−%s)",
+			html.EscapeString(heroName), html.EscapeString(itemName), html.EscapeString(priceText)),
+		"#2ecc71",
+	)
+
 	newBytes, err := json.Marshal(heroData)
 	if err != nil {
 		return nil, err
@@ -987,7 +998,6 @@ func (r *HeroRepository) BuyItemFromShop(ctx context.Context, tgID int64, itemNa
 		return nil, err
 	}
 
-	heroName := domain.GetStr(heroData, "name", "Герой")
 	appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🛒 [TG] %s купил: %s (−%s)", heroName, itemName, priceText))
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1756,4 +1766,46 @@ func (r *HeroRepository) resolveRoomCode(ctx context.Context, chatID, senderID i
 	}
 
 	return "", fmt.Errorf("персонаж не привязан к кампании")
+}
+
+// pushGmToastToHeroData добавляет всплывающее уведомление для веб-интерфейса Мастера в hero_data
+func pushGmToastToHeroData(heroData map[string]any, idPrefix, toastHtml, color string) {
+	if heroData == nil || toastHtml == "" {
+		return
+	}
+	var gmToasts []any
+	if rawList, ok := heroData["_gmToasts"].([]any); ok {
+		gmToasts = rawList
+	}
+	gmToasts = append(gmToasts, map[string]any{
+		"id":    fmt.Sprintf("%s_%d", idPrefix, time.Now().UnixNano()),
+		"text":  toastHtml,
+		"color": color,
+	})
+	if len(gmToasts) > 5 {
+		gmToasts = gmToasts[len(gmToasts)-5:]
+	}
+	heroData["_gmToasts"] = gmToasts
+}
+
+// GetActiveGroupChatIDs возвращает список привязанных групповых чатов кампаний
+func (r *HeroRepository) GetActiveGroupChatIDs(ctx context.Context) ([]int64, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT DISTINCT telegram_chat_id
+		FROM public.campaign_state
+		WHERE telegram_chat_id IS NOT NULL AND telegram_chat_id <> 0
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var chatIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil && id != 0 {
+			chatIDs = append(chatIDs, id)
+		}
+	}
+	return chatIDs, nil
 }
