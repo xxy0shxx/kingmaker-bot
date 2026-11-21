@@ -1859,3 +1859,89 @@ func (r *HeroRepository) GetActiveGroupChatIDs(ctx context.Context) ([]int64, er
 	}
 	return chatIDs, nil
 }
+
+type RiddleRewardResult struct {
+	HeroName        string
+	TotalWins       int
+	WinsTowardsNext int  // От 1 до 5
+	AwardedPoint    bool // true, если ровно 5-я победа и выдано очко героизма
+	NewHeroPoints   int
+}
+
+// RecordRiddleWin засчитывает отгадку герою и за каждые 5 побед начисляет +1 очко героизма
+func (r *HeroRepository) RecordRiddleWin(ctx context.Context, tgUserID int64) (*RiddleRewardResult, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var heroID, roomCode string
+	var rawJSON []byte
+	err = tx.QueryRow(ctx, `
+		SELECT id, room_code, hero_data
+		FROM public.campaign_heroes
+		WHERE telegram_user_id = $1
+		FOR UPDATE
+	`, tgUserID).Scan(&heroID, &roomCode, &rawJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	var heroData map[string]any
+	if err := json.Unmarshal(rawJSON, &heroData); err != nil {
+		return nil, err
+	}
+
+	stats := ensureStatsMap(heroData)
+	heroName := domain.GetStr(heroData, "name", "Герой")
+
+	totalWins := domain.GetInt(heroData, "riddleWins", 0) + 1
+	heroData["riddleWins"] = totalWins
+
+	towardsNext := totalWins % 5
+	awarded := false
+	curHPts := domain.GetInt(stats, "heroPoints", 0)
+
+	if towardsNext == 0 {
+		towardsNext = 5
+		awarded = true
+		curHPts++
+		stats["heroPoints"] = curHPts
+
+		// Уведомляем Мастера в веб-интерфейсе
+		pushGmToastToHeroData(
+			heroData,
+			"tg_riddle_hp",
+			fmt.Sprintf("🌟 <b>%s</b> отгадал 5 загадок Бересты и получил внештатное <b>Очко героизма</b> (всего: <b>%d</b>)!",
+				html.EscapeString(heroName), curHPts),
+			"#ffd875",
+		)
+		appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🌟 [Загадки] %s отгадал 5 загадок и получил +1 Очко героизма!", heroName))
+	}
+
+	newBytes, err := json.Marshal(heroData)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE public.campaign_heroes
+		SET hero_data = $1::jsonb, updated_at = NOW()
+		WHERE id = $2
+	`, string(newBytes), heroID); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	return &RiddleRewardResult{
+		HeroName:        heroName,
+		TotalWins:       totalWins,
+		WinsTowardsNext: towardsNext,
+		AwardedPoint:    awarded,
+		NewHeroPoints:   curHPts,
+	}, nil
+}

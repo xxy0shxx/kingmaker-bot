@@ -3460,6 +3460,27 @@ func (h *BotHandler) handleRiddleAnswerCallback(c tele.Context) error {
 	if optIdx == st.Riddle.Correct {
 		st.Solved = true
 		st.WinnerName = speakerName
+
+		rewardLine := ""
+		if res, err := h.repo.RecordRiddleWin(context.Background(), tgID); err == nil && res != nil {
+			speakerName = res.HeroName
+			st.WinnerName = res.HeroName
+			if res.AwardedPoint {
+				rewardLine = fmt.Sprintf(
+					"\n\n🎉 <b>ЮБИЛЕЙНАЯ 5-Я ОТГАДКА!</b>\n"+
+						"🌟 Герой <b>%s</b> получает внештатное <b>Очко героизма</b>! (Теперь в листе: <code>%d</code>)",
+					html.EscapeString(res.HeroName),
+					res.NewHeroPoints,
+				)
+			} else {
+				rewardLine = fmt.Sprintf(
+					"\n📊 <i>Счётчик мудрости: <b>%d / 5</b> до внештатного Очка героизма (всего отгадано: %d).</i>",
+					res.WinsTowardsNext,
+					res.TotalWins,
+				)
+			}
+		}
+
 		_ = c.Respond(&tele.CallbackResponse{Text: "🌟 Верно! Натуральная двадцатка на проверку Знаний!"})
 
 		solvedText := fmt.Sprintf(
@@ -3467,11 +3488,12 @@ func (h *BotHandler) handleRiddleAnswerCallback(c tele.Context) error {
 				"━━━━━━━━━━━━━━━━━━━━\n"+
 				"📜 <i>«%s»</i>\n\n"+
 				"✅ <b>Правильный ответ:</b> <code>%s</code>\n"+
-				"🏆 <b>Знаток костра:</b> <b>%s</b>!\n"+
+				"🏆 <b>Знаток костра:</b> <b>%s</b>!%s\n"+
 				"🐾 <i>Береста торжественно поправляет невидимые очки и вносит имя победителя в свиток мудрецов!</i>",
 			html.EscapeString(st.Riddle.Question),
 			html.EscapeString(st.Riddle.Options[st.Riddle.Correct]),
 			html.EscapeString(speakerName),
+			rewardLine,
 		)
 		return c.Edit(solvedText, tele.ModeHTML)
 	}
