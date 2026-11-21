@@ -993,11 +993,11 @@ func (h *BotHandler) handleUnequipAction(c tele.Context) error {
 	gearType := c.Callback().Data
 	removedName, newAC, err := h.repo.UnequipGear(context.Background(), c.Sender().ID, gearType)
 	if err != nil {
-		return c.Edit(fmt.Sprintf("❌ Ошибка: %s", err.Error()))
+		return c.Edit(fmt.Sprintf("❌ Ошибка: %s", html.EscapeString(err.Error())), tele.ModeHTML)
 	}
 	return c.Edit(
-		fmt.Sprintf("✅ Вы сняли *%s*.\n🛡️ Новый итоговый КБ: *%d*", removedName, newAC),
-		tele.ModeMarkdown,
+		fmt.Sprintf("✅ Вы сняли <b>%s</b>.\n🛡️ Новый итоговый КБ: <b>%d</b>", html.EscapeString(removedName), newAC),
+		tele.ModeHTML,
 	)
 }
 
@@ -1009,11 +1009,11 @@ func (h *BotHandler) handleEquipFromBagAction(c tele.Context) error {
 	}
 	equippedName, newAC, err := h.repo.EquipFromBackpack(context.Background(), c.Sender().ID, slotIdx)
 	if err != nil {
-		return c.Edit(fmt.Sprintf("❌ Ошибка: %s", err.Error()))
+		return c.Edit(fmt.Sprintf("❌ Ошибка: %s", html.EscapeString(err.Error())), tele.ModeHTML)
 	}
 	return c.Edit(
-		fmt.Sprintf("✅ Вы надели *%s*!\n🛡️ Новый итоговый КБ: *%d*", equippedName, newAC),
-		tele.ModeMarkdown,
+		fmt.Sprintf("✅ Вы надели <b>%s</b>!\n🛡️ Новый итоговый КБ: <b>%d</b>", html.EscapeString(equippedName), newAC),
+		tele.ModeHTML,
 	)
 }
 
@@ -1739,8 +1739,9 @@ func (h *BotHandler) tryAnswerBerestaRoomQuery(ctx context.Context, c tele.Conte
 	isQuests := containsAny(lower, "квест", "задан", "слух", "зацепк", "поручен", "мисси", "что делать", "куда дальше")
 	isRations := containsAny(lower, "паек", "пайк", "сухпа", "ед", "провиз", "ингредиент", "припас", "сколько дней")
 	isSession := containsAny(lower, "когда игра", "когда сесси", "следующая игра", "следующая сесси", "расписан", "доска объявлен", "сбор отряда")
+	isRiddles := containsAny(lower, "загадк", "знаток", "мудрец", "отгад", "викторин", "самый умный", "рейтинг")
 
-	if !isTreasury && !isShop && !isLocation && !isWounded && !isRich && !isQuests && !isRations && !isSession {
+	if !isTreasury && !isShop && !isLocation && !isWounded && !isRich && !isQuests && !isRations && !isSession && !isRiddles {
 		return "", false
 	}
 
@@ -1750,6 +1751,32 @@ func (h *BotHandler) tryAnswerBerestaRoomQuery(ctx context.Context, c tele.Conte
 	}
 
 	switch {
+	case isRiddles:
+		leaders, err := h.repo.GetRiddleLeaderboard(ctx, c.Chat().ID, c.Sender().ID, c.Chat().Type == tele.ChatPrivate)
+		if err != nil {
+			return fmt.Sprintf("🐾 Не удалось заглянуть в свиток мудрецов: <i>%s</i>", html.EscapeString(err.Error())), true
+		}
+		if len(leaders) == 0 {
+			return "🕯️ <b>Свиток знатоков костра пока чист!</b>\nДождитесь дневной загадки от Бересты и станьте первым мудрецом отряда.", true
+		}
+
+		medals := []string{"🥇", "🥈", "🥉"}
+		var sb strings.Builder
+		sb.WriteString("🏆 <b>Свиток мудрецов и знатоков костра:</b>\n━━━━━━━━━━━━━━━━━━━━\n")
+		for i, l := range leaders {
+			prefix := fmt.Sprintf("<b>%d.</b>", i+1)
+			if i < len(medals) {
+				prefix = medals[i]
+			}
+			hpBadge := ""
+			if l.HeroPointsEarned > 0 {
+				hpBadge = fmt.Sprintf(" • 🌟 <code>+%d ОГ</code>", l.HeroPointsEarned)
+			}
+			sb.WriteString(fmt.Sprintf("%s <b>%s</b> — <code>%d</code> отгадок (попыток: %d)%s\n",
+				prefix, html.EscapeString(l.DisplayName), l.TotalWins, l.TotalAttempts, hpBadge))
+		}
+		sb.WriteString("\n<i>Каждая 5-я отгадка приносит +1 внештатное Очко героизма!</i>")
+		return sb.String(), true
 	case isSession:
 		return h.formatNextSessionInfo(ctx, c), true
 	case isRations:
@@ -3462,22 +3489,25 @@ func (h *BotHandler) handleRiddleAnswerCallback(c tele.Context) error {
 		st.WinnerName = speakerName
 
 		rewardLine := ""
-		if res, err := h.repo.RecordRiddleWin(context.Background(), tgID); err == nil && res != nil {
+		if res, err := h.repo.RecordRiddleWin(context.Background(), c.Chat().ID, tgID, speakerName); err == nil && res != nil {
 			speakerName = res.HeroName
 			st.WinnerName = res.HeroName
 			if res.AwardedPoint {
 				rewardLine = fmt.Sprintf(
-					"\n\n🎉 <b>ЮБИЛЕЙНАЯ 5-Я ОТГАДКА!</b>\n"+
+					"\n\n🎉 <b>ЮБИЛЕЙНАЯ %d-Я ОТГАДКА!</b>\n"+
 						"🌟 Герой <b>%s</b> получает внештатное <b>Очко героизма</b>! (Теперь в листе: <code>%d</code>)",
+					res.TotalWins,
 					html.EscapeString(res.HeroName),
 					res.NewHeroPoints,
 				)
-			} else {
+			} else if res.HasLinkedHero {
 				rewardLine = fmt.Sprintf(
 					"\n📊 <i>Счётчик мудрости: <b>%d / 5</b> до внештатного Очка героизма (всего отгадано: %d).</i>",
 					res.WinsTowardsNext,
 					res.TotalWins,
 				)
+			} else {
+				rewardLine = fmt.Sprintf("\n📊 <i>Всего отгадано загадок: <b>%d</b>.</i>", res.TotalWins)
 			}
 		}
 
@@ -3498,11 +3528,13 @@ func (h *BotHandler) handleRiddleAnswerCallback(c tele.Context) error {
 		return c.Edit(solvedText, tele.ModeHTML)
 	}
 
+	h.repo.RecordRiddleAttempt(context.Background(), c.Chat().ID, tgID, speakerName)
 	_ = c.Respond(&tele.CallbackResponse{
-		Text:      fmt.Sprintf("🐈‍⬛ Мимо, %s! Свитки шепчут, что это неверный ответ. Подсказка: %s", speakerName, st.Riddle.Hint),
+		Text:      fmt.Sprintf("🐈‍⬛ Мимо, %s! Подсказка: %s", speakerName, st.Riddle.Hint),
 		ShowAlert: true,
 	})
 	return nil
+
 }
 
 func (h *BotHandler) handleRiddleRevealCallback(c tele.Context) error {

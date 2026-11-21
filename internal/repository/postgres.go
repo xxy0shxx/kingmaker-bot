@@ -278,10 +278,15 @@ func (r *HeroRepository) TransferItem(ctx context.Context, senderTgID int64, slo
 }
 
 func ensureStatsMap(d map[string]any) map[string]any {
+	if d == nil {
+		return make(map[string]any)
+	}
 	if s, ok := d["stats"].(map[string]any); ok && s != nil {
 		return s
 	}
-	return d
+	s := make(map[string]any)
+	d["stats"] = s
+	return s
 }
 
 func normalizeItemName(s string) string {
@@ -487,7 +492,7 @@ func (r *HeroRepository) UnequipGear(ctx context.Context, tgID int64, gearType s
 		return "", 0, fmt.Errorf("лист персонажа заблокирован Мастером")
 	}
 
-	stats := hero.Stats()
+	stats := ensureStatsMap(hero.Data)
 	removedName := ""
 
 	switch gearType {
@@ -669,7 +674,7 @@ func (r *HeroRepository) EquipFromBackpack(ctx context.Context, tgID int64, slot
 		return "", 0, fmt.Errorf("лист персонажа заблокирован Мастером")
 	}
 
-	stats := hero.Stats()
+	stats := ensureStatsMap(hero.Data)
 	nameKey := fmt.Sprintf("item%dName", slotIdx)
 	qtyKey := fmt.Sprintf("item%dQty", slotIdx)
 	notesKey := fmt.Sprintf("item%dNotes", slotIdx)
@@ -1862,75 +1867,145 @@ func (r *HeroRepository) GetActiveGroupChatIDs(ctx context.Context) ([]int64, er
 
 type RiddleRewardResult struct {
 	HeroName        string
+	HasLinkedHero   bool
 	TotalWins       int
 	WinsTowardsNext int  // От 1 до 5
 	AwardedPoint    bool // true, если ровно 5-я победа и выдано очко героизма
 	NewHeroPoints   int
 }
 
-// RecordRiddleWin засчитывает отгадку герою и за каждые 5 побед начисляет +1 очко героизма
-func (r *HeroRepository) RecordRiddleWin(ctx context.Context, tgUserID int64) (*RiddleRewardResult, error) {
+type RiddleLeaderEntry struct {
+	DisplayName      string
+	TotalWins        int
+	TotalAttempts    int
+	HeroPointsEarned int
+}
+
+// RecordRiddleAttempt фиксирует неудачную попытку ответа в статистике комнаты
+func (r *HeroRepository) RecordRiddleAttempt(ctx context.Context, chatID, tgUserID int64, fallbackName string) {
+	roomCode, err := r.resolveRoomCode(ctx, chatID, tgUserID, chatID > 0)
+	if err != nil || roomCode == "" {
+		return
+	}
+
+	displayName := strings.TrimSpace(fallbackName)
+	if displayName == "" {
+		displayName = "Игрок"
+	}
+	if hero, err := r.GetHeroByTgID(ctx, tgUserID); err == nil && hero != nil {
+		displayName = domain.GetStr(hero.Data, "name", displayName)
+	}
+
+	_, _ = r.db.Exec(ctx, `
+		INSERT INTO public.riddle_stats (room_code, telegram_user_id, display_name, total_wins, total_attempts, updated_at)
+		VALUES ($1, $2, $3, 0, 1, NOW())
+		ON CONFLICT (room_code, telegram_user_id)
+		DO UPDATE SET
+			display_name = EXCLUDED.display_name,
+			total_attempts = public.riddle_stats.total_attempts + 1,
+			updated_at = NOW()
+	`, roomCode, tgUserID, displayName)
+}
+
+// RecordRiddleWin засчитывает отгадку в БД (riddle_stats) и за каждые 5 побед начисляет +1 очко героизма привязанному герою
+func (r *HeroRepository) RecordRiddleWin(ctx context.Context, chatID, tgUserID int64, fallbackName string) (*RiddleRewardResult, error) {
+	roomCode, err := r.resolveRoomCode(ctx, chatID, tgUserID, chatID > 0)
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	var heroID, roomCode string
+	displayName := strings.TrimSpace(fallbackName)
+	if displayName == "" {
+		displayName = "Игрок"
+	}
+
+	// 1. Проверяем, привязан ли к пользователю герой в этой комнате
+	var heroID string
 	var rawJSON []byte
+	hasHero := false
 	err = tx.QueryRow(ctx, `
-		SELECT id, room_code, hero_data
+		SELECT id, hero_data
 		FROM public.campaign_heroes
-		WHERE telegram_user_id = $1
+		WHERE telegram_user_id = $1 AND room_code = $2
 		FOR UPDATE
-	`, tgUserID).Scan(&heroID, &roomCode, &rawJSON)
-	if err != nil {
-		return nil, err
+	`, tgUserID, roomCode).Scan(&heroID, &rawJSON)
+	if err == nil {
+		hasHero = true
 	}
 
 	var heroData map[string]any
-	if err := json.Unmarshal(rawJSON, &heroData); err != nil {
-		return nil, err
+	if hasHero {
+		if err := json.Unmarshal(rawJSON, &heroData); err == nil {
+			displayName = domain.GetStr(heroData, "name", displayName)
+		} else {
+			hasHero = false
+		}
 	}
 
-	stats := ensureStatsMap(heroData)
-	heroName := domain.GetStr(heroData, "name", "Герой")
-
-	totalWins := domain.GetInt(heroData, "riddleWins", 0) + 1
-	heroData["riddleWins"] = totalWins
-
-	towardsNext := totalWins % 5
-	awarded := false
-	curHPts := domain.GetInt(stats, "heroPoints", 0)
-
-	if towardsNext == 0 {
-		towardsNext = 5
-		awarded = true
-		curHPts++
-		stats["heroPoints"] = curHPts
-
-		// Уведомляем Мастера в веб-интерфейсе
-		pushGmToastToHeroData(
-			heroData,
-			"tg_riddle_hp",
-			fmt.Sprintf("🌟 <b>%s</b> отгадал 5 загадок Бересты и получил внештатное <b>Очко героизма</b> (всего: <b>%d</b>)!",
-				html.EscapeString(heroName), curHPts),
-			"#ffd875",
-		)
-		appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🌟 [Загадки] %s отгадал 5 загадок и получил +1 Очко героизма!", heroName))
-	}
-
-	newBytes, err := json.Marshal(heroData)
+	// 2. Атомарно обновляем счётчик побед и попыток в public.riddle_stats
+	var totalWins int
+	err = tx.QueryRow(ctx, `
+		INSERT INTO public.riddle_stats (room_code, telegram_user_id, display_name, total_wins, total_attempts, last_win_at, updated_at)
+		VALUES ($1, $2, $3, 1, 1, NOW(), NOW())
+		ON CONFLICT (room_code, telegram_user_id)
+		DO UPDATE SET
+			display_name = EXCLUDED.display_name,
+			total_wins = public.riddle_stats.total_wins + 1,
+			total_attempts = public.riddle_stats.total_attempts + 1,
+			last_win_at = NOW(),
+			updated_at = NOW()
+		RETURNING total_wins
+	`, roomCode, tgUserID, displayName).Scan(&totalWins)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := tx.Exec(ctx, `
-		UPDATE public.campaign_heroes
-		SET hero_data = $1::jsonb, updated_at = NOW()
-		WHERE id = $2
-	`, string(newBytes), heroID); err != nil {
-		return nil, err
+	towardsNext := totalWins % 5
+	awarded := false
+	curHPts := 0
+
+	if towardsNext == 0 {
+		towardsNext = 5
+		if hasHero {
+			awarded = true
+			stats := ensureStatsMap(heroData)
+			curHPts = domain.GetInt(stats, "heroPoints", 0) + 1
+			stats["heroPoints"] = curHPts
+			heroData["riddleWins"] = totalWins
+
+			_, _ = tx.Exec(ctx, `
+				UPDATE public.riddle_stats
+				SET hero_points_earned = hero_points_earned + 1
+				WHERE room_code = $1 AND telegram_user_id = $2
+			`, roomCode, tgUserID)
+
+			pushGmToastToHeroData(
+				heroData,
+				"tg_riddle_hp",
+				fmt.Sprintf("🌟 <b>%s</b> отгадал %d загадок Бересты и получил внештатное <b>Очко героизма</b> (всего: <b>%d</b>)!",
+					html.EscapeString(displayName), totalWins, curHPts),
+				"#ffd875",
+			)
+			appendRoomAuditLog(ctx, tx, roomCode, fmt.Sprintf("🌟 [Загадки] %s отгадал %d загадок и получил +1 Очко героизма!", displayName, totalWins))
+		}
+	} else if hasHero {
+		heroData["riddleWins"] = totalWins
+	}
+
+	if hasHero {
+		if newBytes, err := json.Marshal(heroData); err == nil {
+			_, _ = tx.Exec(ctx, `
+				UPDATE public.campaign_heroes
+				SET hero_data = $1::jsonb, updated_at = NOW()
+				WHERE id = $2
+			`, string(newBytes), heroID)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1938,10 +2013,40 @@ func (r *HeroRepository) RecordRiddleWin(ctx context.Context, tgUserID int64) (*
 	}
 
 	return &RiddleRewardResult{
-		HeroName:        heroName,
+		HeroName:        displayName,
+		HasLinkedHero:   hasHero,
 		TotalWins:       totalWins,
 		WinsTowardsNext: towardsNext,
 		AwardedPoint:    awarded,
 		NewHeroPoints:   curHPts,
 	}, nil
+}
+
+// GetRiddleLeaderboard возвращает рейтинг знатоков загадок для текущей комнаты
+func (r *HeroRepository) GetRiddleLeaderboard(ctx context.Context, chatID, senderID int64, isPrivate bool) ([]RiddleLeaderEntry, error) {
+	roomCode, err := r.resolveRoomCode(ctx, chatID, senderID, isPrivate)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := r.db.Query(ctx, `
+		SELECT display_name, total_wins, total_attempts, hero_points_earned
+		FROM public.riddle_stats
+		WHERE room_code = $1 AND total_wins > 0
+		ORDER BY total_wins DESC, total_attempts ASC, last_win_at ASC
+		LIMIT 15
+	`, roomCode)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []RiddleLeaderEntry
+	for rows.Next() {
+		var e RiddleLeaderEntry
+		if err := rows.Scan(&e.DisplayName, &e.TotalWins, &e.TotalAttempts, &e.HeroPointsEarned); err == nil {
+			list = append(list, e)
+		}
+	}
+	return list, nil
 }

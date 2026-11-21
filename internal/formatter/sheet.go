@@ -20,9 +20,12 @@ func FormatPage1(h *domain.HeroRecord) string {
 	alignment := domain.GetStr(s, "alignment", "")
 	lvl := domain.GetInt(s, "level", 1)
 	xp := domain.GetInt(s, "xp", 0)
+	heroPts := domain.GetInt(s, "heroPoints", 1)
+	edicts := domain.GetStr(s, "edicts", "")
+	anathema := domain.GetStr(s, "anathema", "")
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🛡️ *%s* (Ур. %d | Опыт: %d)\n", name, lvl, xp))
+	sb.WriteString(fmt.Sprintf("🛡️ *%s* (Ур. %d | Опыт: %d | 🌟 Героизм: %d)\n", name, lvl, xp, heroPts))
 
 	var bioParts []string
 	if ancestry != "" {
@@ -47,6 +50,13 @@ func FormatPage1(h *domain.HeroRecord) string {
 			sb.WriteString(fmt.Sprintf("📜 Происхождение: _%s_\n", background))
 		}
 	}
+	if edicts != "" {
+		sb.WriteString(fmt.Sprintf("📜 Указы: _%s_\n", edicts))
+	}
+	if anathema != "" {
+		sb.WriteString(fmt.Sprintf("🚫 Анафема: _%s_\n", anathema))
+	}
+
 	sb.WriteString("━━━━━━━━━━━━━━━━━━━━\n")
 
 	hpCur := domain.GetInt(s, "hpCurrent", 0)
